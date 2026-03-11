@@ -140,7 +140,7 @@ DiagnosisAgent                     ResolutionAgent
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/bmk99/IncidentZero.git
+git clone https://github.com/kiran797979/IncidentZero.git
 cd IncidentZero
 ```
 

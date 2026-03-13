@@ -641,7 +641,7 @@ def api_target_metrics(req: func.HttpRequest) -> func.HttpResponse:
 # ═══════════════════════════════════════════════════════════
 
 @app.route(route="run-incident", methods=["POST", "OPTIONS"])
-def run_incident(req: func.HttpRequest) -> func.HttpResponse:
+async def run_incident(req: func.HttpRequest) -> func.HttpResponse:
     """
     Triggers the complete autonomous incident lifecycle:
       1. Inject bug → 2. Detect → 3. Triage → 4. Diagnose →
@@ -665,33 +665,11 @@ def run_incident(req: func.HttpRequest) -> func.HttpResponse:
     message_store.clear()
     incident_store.clear()
     incident_running = True
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        result = loop.run_until_complete(run_full_incident(incident_id))
-    except Exception as e:
-        logger.error(f"Incident lifecycle error: {e}")
-        result = {"error": str(e)}
-        add_message(
-            sender="OrchestratorAgent",
-            recipient="broadcast",
-            msg_type="status",
-            channel="system.status",
-            incident_id=incident_id,
-            payload={"status": "ERROR", "error": str(e)},
-        )
-    finally:
-        loop.close()
-        incident_running = False
-
-    logger.info(f"■ Incident lifecycle complete: {incident_id}")
+    asyncio.create_task(run_full_incident(incident_id))
 
     return make_response({
         "incident_id": incident_id,
-        "status": "COMPLETED",
-        "result": result,
-        "total_messages": len(message_store),
+        "status": "STARTED",
     })
 
 
@@ -702,6 +680,7 @@ def run_incident(req: func.HttpRequest) -> func.HttpResponse:
 async def run_full_incident(incident_id: str) -> dict:
     """Execute the complete autonomous incident resolution pipeline"""
     import httpx
+    global incident_running
 
     target = TARGET_APP_URL
     start_time = datetime.utcnow()
@@ -1208,6 +1187,8 @@ async def run_full_incident(incident_id: str) -> dict:
         f"Health: {health_status} | "
         f"Messages: {len(message_store)}"
     )
+
+    incident_running = False
 
     return {
         "incident_id": incident_id,

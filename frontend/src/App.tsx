@@ -1,9 +1,12 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from "react";
-import { useWebSocket, MCPMessage } from "./hooks/useWebSocket";
+import { usePolling, MCPMessage } from "./hooks/usePolling";
 import "./App.css";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8080";
-const WS_URL = process.env.REACT_APP_WS_URL || "ws://localhost:8080/ws";
+const BACKEND_URL =
+  process.env.REACT_APP_BACKEND_URL || "http://localhost:7071/api";
+
+const TARGET_URL =
+  process.env.REACT_APP_TARGET_URL || "http://localhost:7072/api";
 
 /* ═══════════════════════════════════════════════════════════
    Constants
@@ -79,7 +82,7 @@ function Sparkline({ values, color, width = 80, height = 24 }: { values: number[
    Main App
    ═══════════════════════════════════════════════════════════ */
 function App() {
-  const { messages, connected } = useWebSocket(WS_URL);
+  const { messages, connected, clearMessages } = usePolling(BACKEND_URL, 2000);
   
   // ─── State ──────────────────────────────────────────────
   const [injecting, setInjecting] = useState(false);
@@ -206,39 +209,30 @@ function App() {
   }, [debateMessages.length, postmortem, activeTab]);
 
   // ─── Actions ────────────────────────────────────────────
-  const injectBug = useCallback(async () => {
+  const injectBug = async () => {
     setInjecting(true);
     setBugActive(true);
-    setIncidentStartTime(Date.now());
-    setElapsedTime(0);
-    setShowPostmortem(false);
-    setShowCelebration(false);
-    setActiveTab("timeline");
-    setErrorHistory([0]);
-    setConnHistory([0]);
-    setRespHistory([0]);
-    setMsgHistory([0]);
+    clearMessages();
 
     try {
-      await fetch(`${BACKEND_URL}/api/inject`, { method: "POST" });
-      
-      // Poll a few times to see if the target health check drops (expected failure behavior)
-      for (let i = 0; i < 3; i++) {
-        try { 
-          const res = await fetch(`${BACKEND_URL}/api/target/health`); 
-          if (!res.ok) break; // System has degraded as expected!
-        } catch {
-          break; // Network error means it's likely down
-        }
-        await new Promise((r) => setTimeout(r, 500));
+      const resp = await fetch(BACKEND_URL + "/run-incident", {
+        method: "POST",
+      });
+
+      if (!resp.ok) {
+        console.error("Failed to trigger incident:", resp.statusText);
+      } else {
+        const data = await resp.json();
+        console.log("Incident result:", data);
       }
-    } catch (e) { 
-      console.error("Inject failed:", e); 
-      setBugActive(false); // Revert UI if the inject failed entirely
-    } finally {
-      setInjecting(false);
+    } catch (e) {
+      console.error("Error triggering incident:", e);
     }
-  }, []);
+
+    setTimeout(() => {
+      setInjecting(false);
+    }, 5000);
+  };
 
   // ─── Helpers ────────────────────────────────────────────
   const formatTime = (ts: string) => {

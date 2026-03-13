@@ -1,12 +1,9 @@
-import React, { useState, useMemo, useEffect, useRef, useCallback } from "react";
+import React, { useState, useMemo, useEffect, useRef} from "react";
 import { usePolling, MCPMessage } from "./hooks/usePolling";
 import "./App.css";
 
 const BACKEND_URL =
   process.env.REACT_APP_BACKEND_URL || "http://localhost:7071/api";
-
-const TARGET_URL =
-  process.env.REACT_APP_TARGET_URL || "http://localhost:7072/api";
 
 /* ═══════════════════════════════════════════════════════════
    Constants
@@ -212,6 +209,7 @@ function App() {
   const injectBug = async () => {
     setInjecting(true);
     setBugActive(true);
+    setIncidentStartTime(Date.now());
     clearMessages();
 
     try {

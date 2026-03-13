@@ -87,6 +87,8 @@ DETECTED → TRIAGING → DIAGNOSING → DEBATING → RESOLVING → DEPLOYING �
 | 6 | 🚀 **DeployAgent** | Applies the fix to the target app, verifies health recovery (up to 5 retries), optionally opens a GitHub PR. |
 | 7 | 📋 **PostmortemAgent** | Produces a full incident report: timeline, root cause, debate highlights, impact, lessons learned, and prevention recommendations. |
 
+> **Demo pacing:** In the Azure backend `run_incident` flow, each major stage is intentionally delayed by ~2 seconds so the dashboard timeline animates step-by-step (Detection → Triage → Diagnosis → Debate → Resolution → Deploy → Postmortem).
+
 ### ⚔️ The Debate Protocol
 
 IncidentZero's key innovation is the **structured adversarial debate** between ResolutionAgent and DiagnosisAgent, ensuring diagnostic rigor before any fix is applied:
@@ -213,6 +215,19 @@ The React frontend provides a cinematic, real-time view of the entire incident l
 | **Flash Effect** | Screen flash on incident detection |
 
 > **Reliability:** Data is sourced from both WebSocket (real-time push) and REST API polling (fallback every 3s during incidents, 10s idle) to ensure no messages are lost during WebSocket reconnection cycles.
+
+---
+
+## ☁️ Azure Backend Deploy
+
+To publish the Azure Functions backend after backend changes:
+
+```bash
+cd azure-backend
+func azure functionapp publish incidentzero-backend
+```
+
+> Ensure your local Python version matches the Azure Function App runtime version to avoid runtime dependency issues.
 
 ---
 

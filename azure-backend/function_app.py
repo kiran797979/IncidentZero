@@ -1,3 +1,4 @@
+
 """
 IncidentZero Backend — Azure Functions (Serverless)
 Autonomous AI SRE Team — Multi-Agent Incident Resolution
@@ -22,11 +23,16 @@ import logging
 import os
 import base64
 import random
-from datetime import datetime
+import re
+import httpx
+from datetime import datetime, timezone
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger("incidentzero")
 
 
@@ -44,7 +50,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TARGET_APP_URL = os.getenv(
     "TARGET_APP_URL",
     "https://incidentzero-target.azurewebsites.net",
-)
+).rstrip("/")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "")
 GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "incidentzero")
@@ -63,27 +69,27 @@ INCIDENT_SCENARIOS = [
         "symptoms": {
             "error_rate": 0.42,
             "latency_ms": 8000,
-            "connections": "100/100"
+            "connections": "100/100",
         },
-        "root_cause": "Connections are not released in the finally block causing pool exhaustion"
+        "root_cause": "Connections are not released in the finally block causing pool exhaustion",
     },
     {
         "type": "memory_leak",
         "description": "Memory usage increasing due to unbounded cache growth",
         "symptoms": {
             "memory_usage": "92%",
-            "latency_ms": 4200
+            "latency_ms": 4200,
         },
-        "root_cause": "Cache storing objects without eviction policy causing memory leak"
+        "root_cause": "Cache storing objects without eviction policy causing memory leak",
     },
     {
         "type": "slow_database_queries",
         "description": "Database queries slow due to missing index",
         "symptoms": {
             "latency_ms": 6000,
-            "query_time": "5s"
+            "query_time": "5s",
         },
-        "root_cause": "Missing database index causing full table scans"
+        "root_cause": "Missing database index causing full table scans",
     },
     {
         "type": "external_api_failure",
@@ -91,24 +97,25 @@ INCIDENT_SCENARIOS = [
         "symptoms": {
             "error_rate": 0.37,
             "api_status": "503",
-            "latency_ms": 7000
+            "latency_ms": 7000,
         },
-        "root_cause": "Upstream payment API intermittently failing"
+        "root_cause": "Upstream payment API intermittently failing",
     },
     {
         "type": "cache_failure",
         "description": "Redis cache unavailable causing heavy DB load",
         "symptoms": {
             "cache_status": "down",
-            "db_load": "high"
+            "db_load": "high",
         },
-        "root_cause": "Redis node unavailable forcing database reads"
-    }
+        "root_cause": "Redis node unavailable forcing database reads",
+    },
 ]
 
 
 # ═══════════════════════════════════════════════════════════
 # IN-MEMORY STORES
+# (Ephemeral in pure serverless — works for single-instance demos)
 # ═══════════════════════════════════════════════════════════
 
 message_store: list = []
@@ -119,6 +126,11 @@ incident_running: bool = False
 # ═══════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════
+
+def get_iso_now() -> str:
+    """Returns a strict ISO 8601 UTC timestamp ending in Z."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 
 def add_message(
     sender: str,
@@ -140,14 +152,14 @@ def add_message(
         "incident_id": incident_id,
         "confidence": confidence,
         "evidence": evidence or [],
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": get_iso_now(),
     }
     message_store.append(msg)
     logger.info(f"[MCP] {sender} -> {recipient} | {msg_type} | {channel}")
     return msg
 
 
-def send_stage(stage_name, incident_id):
+def send_stage(stage_name: str, incident_id: str) -> None:
     add_message(
         sender="OrchestratorAgent",
         recipient="Dashboard",
@@ -158,7 +170,7 @@ def send_stage(stage_name, incident_id):
     )
 
 
-def make_response(data, status_code=200):
+def make_response(data: dict, status_code: int = 200) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps(data, default=str),
         status_code=status_code,
@@ -167,144 +179,126 @@ def make_response(data, status_code=200):
     )
 
 
-def cors_preflight():
+def cors_preflight() -> func.HttpResponse:
     return func.HttpResponse(status_code=204, headers=CORS_HEADERS)
 
 
 def get_llm_provider() -> str:
-    """Detect which LLM provider is available"""
+    """Detect which LLM provider is available."""
     if AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT:
         return "azure_openai"
-    elif OPENROUTER_API_KEY:
+    if OPENROUTER_API_KEY:
         return "openrouter"
-    elif OPENAI_API_KEY:
+    if OPENAI_API_KEY:
         return "openai"
-    else:
-        return "mock"
+    return "mock"
 
 
 LLM_PROVIDER = get_llm_provider()
-logger.info(f"LLM Provider: {LLM_PROVIDER}")
+logger.info(f"Initialized LLM Provider: {LLM_PROVIDER}")
 
 
 # ═══════════════════════════════════════════════════════════
-# LLM SERVICE — Azure OpenAI → OpenRouter → OpenAI → Mock Fallback
+# LLM SERVICE — Azure OpenAI → OpenRouter → OpenAI → Mock
 # ═══════════════════════════════════════════════════════════
 
 async def _call_azure_openai(system_prompt: str, user_prompt: str) -> str:
-    try:
-        from openai import AsyncAzureOpenAI
+    from openai import AsyncAzureOpenAI
 
-        client = AsyncAzureOpenAI(
-            api_key=AZURE_OPENAI_KEY,
-            api_version=AZURE_OPENAI_API_VERSION,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        )
-        response = await client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=2000,
-        )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("Azure OpenAI response content is empty")
-        logger.info("[LLM] Azure OpenAI response received")
-        return content
-    except Exception as e:
-        logger.error(f"[LLM] Azure OpenAI error: {e}")
-        return mock_response(system_prompt, user_prompt)
+    client = AsyncAzureOpenAI(
+        api_key=AZURE_OPENAI_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    )
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=2000,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise ValueError("Azure OpenAI response content is empty")
+    logger.info("[LLM] Azure OpenAI response received")
+    return content
+
 
 async def _call_openrouter(system_prompt: str, user_prompt: str) -> str:
-    try:
-        import httpx
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 2000,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 2000,
-        }
+    async with httpx.AsyncClient(timeout=45) as client:
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
 
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("OpenRouter response missing choices")
 
-        async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        raise ValueError("OpenRouter response missing message")
 
-        choices = data.get("choices") if isinstance(data, dict) else None
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("OpenRouter response missing choices")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("OpenRouter response content is empty or invalid")
 
-        message = choices[0].get("message") if isinstance(choices[0], dict) else None
-        if not isinstance(message, dict):
-            raise ValueError("OpenRouter response missing message")
-
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("OpenRouter response content is empty or invalid")
-
-        logger.info("[LLM] OpenRouter response received")
-        return content
-    except Exception as e:
-        logger.error(f"[LLM] OpenRouter error: {e}")
-        return mock_response(system_prompt, user_prompt)
+    logger.info("[LLM] OpenRouter response received")
+    return content
 
 
 async def _call_openai(system_prompt: str, user_prompt: str) -> str:
-    try:
-        from openai import AsyncOpenAI
+    from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=2000,
-        )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("OpenAI response content is empty")
-        logger.info("[LLM] OpenAI response received")
-        return content
-    except Exception as e:
-        logger.error(f"[LLM] OpenAI error: {e}")
-        return mock_response(system_prompt, user_prompt)
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=2000,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise ValueError("OpenAI response content is empty")
+    logger.info("[LLM] OpenAI response received")
+    return content
 
 
 async def chat_llm(system_prompt: str, user_prompt: str) -> str:
-    global LLM_PROVIDER
-    provider = get_llm_provider()
-    LLM_PROVIDER = provider
-    logger.info(f"LLM Provider: {LLM_PROVIDER}")
+    """Call the configured LLM provider with automatic mock fallback."""
+    try:
+        if LLM_PROVIDER == "azure_openai":
+            return await _call_azure_openai(system_prompt, user_prompt)
+        if LLM_PROVIDER == "openrouter":
+            return await _call_openrouter(system_prompt, user_prompt)
+        if LLM_PROVIDER == "openai":
+            return await _call_openai(system_prompt, user_prompt)
+    except Exception as e:
+        logger.error(f"[LLM] Error calling {LLM_PROVIDER}: {e}", exc_info=True)
 
-    if provider == "azure_openai":
-        return await _call_azure_openai(system_prompt, user_prompt)
-
-    if provider == "openrouter":
-        return await _call_openrouter(system_prompt, user_prompt)
-
-    if provider == "openai":
-        return await _call_openai(system_prompt, user_prompt)
-
-    logger.info("[LLM] Using mock response (no API keys configured)")
+    logger.info("[LLM] Using mock response (no API keys configured or call failed)")
     return mock_response(system_prompt, user_prompt)
 
 
@@ -334,7 +328,7 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
             ),
         })
 
-    elif "diagnos" in sp and "challenge" not in sp and "defend" not in sp:
+    if "diagnos" in sp and "challenge" not in sp and "defend" not in sp:
         if scenario_type == "memory_leak":
             root_cause_detail = "Unbounded cache storing objects without eviction policy"
             category = "MEMORY_LEAK"
@@ -362,9 +356,7 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
                 "component": component,
                 "file": "app.py",
                 "function": "list_tasks / create_task",
-                "mechanism": (
-                    root_cause_detail
-                ),
+                "mechanism": root_cause_detail,
                 "detail": root_cause_detail,
             },
             "confidence": 0.88,
@@ -382,7 +374,7 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
             ],
         })
 
-    elif "challenge" in sp or "evaluate" in sp or "devil" in sp:
+    if "challenge" in sp or "evaluate" in sp or "devil" in sp:
         if scenario_type == "memory_leak":
             challenge_reason = "Could this memory growth be caused by unbounded caching rather than database usage?"
             alternative = "memory_pressure_from_cache"
@@ -407,7 +399,7 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
             "confidence_in_diagnosis": 0.65,
         })
 
-    elif "defend" in sp or "responding to" in sp:
+    if "defend" in sp or "responding to" in sp:
         return json.dumps({
             "response_type": "DEFEND",
             "response": (
@@ -427,7 +419,7 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
             "confidence": 0.94,
         })
 
-    elif "fix" in sp or "resolution" in sp or "code" in sp:
+    if "fix" in sp or "resolution" in sp or "code" in sp:
         if scenario_type == "memory_leak":
             fix_description = "Add bounded cache with TTL and eviction policy to prevent memory leak"
             fix_diff = (
@@ -514,7 +506,7 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
             ],
         })
 
-    elif "postmortem" in sp:
+    if "postmortem" in sp:
         return (
             "# Incident Postmortem\n\n"
             "## Executive Summary\n\n"
@@ -524,7 +516,7 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
             "detected, diagnosed, debated, and resolved the incident "
             "autonomously in under 90 seconds.\n\n"
             "## Timeline\n\n"
-            "- **T+0s**: WatcherAgent detected error rate spike (0% → 40%+)\n"
+            "- **T+0s**: WatcherAgent detected error rate spike (0% -> 40%+)\n"
             "- **T+5s**: TriageAgent classified as P1 — 42% blast radius\n"
             "- **T+15s**: DiagnosisAgent identified root cause: connection pool leak\n"
             "- **T+25s**: ResolutionAgent CHALLENGED diagnosis — questioned if slow queries\n"
@@ -575,6 +567,12 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
 
 
 def parse_json_response(text: str) -> dict:
+    """Safely extracts and parses JSON even if wrapped in markdown code blocks."""
+    text = text.strip()
+    text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^```\s*$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -582,7 +580,8 @@ def parse_json_response(text: str) -> dict:
             start = text.index("{")
             end = text.rindex("}") + 1
             return json.loads(text[start:end])
-        except (ValueError, json.JSONDecodeError):
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.error(f"[JSON Parse] Failed on: {text[:120]}... Error: {e}")
             return {"raw_response": text}
 
 
@@ -596,10 +595,9 @@ async def create_github_pr(
     diagnosis_summary: str,
 ) -> str:
     """Create a GitHub PR with the fix. Returns PR URL or fallback string."""
+    fallback_url = f"https://github.com/{GITHUB_REPO_OWNER or 'owner'}/{GITHUB_REPO_NAME}"
     if not GITHUB_TOKEN or not GITHUB_REPO_OWNER:
-        return f"https://github.com/{GITHUB_REPO_OWNER or 'owner'}/{GITHUB_REPO_NAME}"
-
-    import httpx
+        return fallback_url
 
     api = "https://api.github.com"
     headers = {
@@ -609,7 +607,6 @@ async def create_github_pr(
     repo = f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
     branch_name = f"fix/{incident_id.lower()}"
     fix_info = fix_data.get("fix", fix_data)
-    fix_file = fix_info.get("file", "app.py")
     fix_desc = fix_info.get("description", "Autonomous fix by IncidentZero")
     fix_diff = fix_info.get("diff", "")
 
@@ -619,7 +616,7 @@ async def create_github_pr(
             resp = await client.get(f"{api}/repos/{repo}", headers=headers)
             if resp.status_code != 200:
                 logger.error(f"GitHub: failed to get repo: {resp.status_code}")
-                return f"https://github.com/{repo}"
+                return fallback_url
             default_branch = resp.json().get("default_branch", "main")
 
             resp = await client.get(
@@ -627,7 +624,7 @@ async def create_github_pr(
                 headers=headers,
             )
             if resp.status_code != 200:
-                return f"https://github.com/{repo}"
+                return fallback_url
             sha = resp.json()["object"]["sha"]
 
             # 2. Create branch
@@ -637,7 +634,7 @@ async def create_github_pr(
                 json={"ref": f"refs/heads/{branch_name}", "sha": sha},
             )
             if resp.status_code not in (200, 201, 422):
-                return f"https://github.com/{repo}"
+                return fallback_url
 
             # 3. Create fix commit
             fix_content = (
@@ -652,7 +649,7 @@ async def create_github_pr(
             )
             encoded = base64.b64encode(fix_content.encode()).decode()
 
-            resp = await client.put(
+            await client.put(
                 f"{api}/repos/{repo}/contents/fixes/{incident_id}-fix.py",
                 headers=headers,
                 json={
@@ -690,16 +687,19 @@ async def create_github_pr(
                 },
             )
             if resp.status_code in (200, 201):
-                pr_url = resp.json().get("html_url", f"https://github.com/{repo}/pulls")
+                pr_url = resp.json().get("html_url", f"{fallback_url}/pulls")
                 logger.info(f"[GitHub] PR created: {pr_url}")
                 return pr_url
             else:
-                logger.error(f"GitHub PR creation failed: {resp.status_code} {resp.text[:200]}")
-                return f"https://github.com/{repo}/pulls"
+                logger.error(
+                    f"GitHub PR creation failed: {resp.status_code} "
+                    f"{resp.text[:200]}"
+                )
+                return f"{fallback_url}/pulls"
 
     except Exception as e:
-        logger.error(f"[GitHub] PR creation error: {e}")
-        return f"https://github.com/{repo}"
+        logger.error(f"[GitHub] PR creation error: {e}", exc_info=True)
+        return fallback_url
 
 
 # ═══════════════════════════════════════════════════════════
@@ -732,30 +732,28 @@ def api_health(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="status", methods=["GET", "OPTIONS"])
 def api_status(req: func.HttpRequest) -> func.HttpResponse:
-    """Lightweight endpoint for frontend connection checks (polled frequently)"""
+    """Lightweight endpoint for frontend connection checks (polled frequently)."""
     if req.method == "OPTIONS":
         return cors_preflight()
     return make_response({
         "connected": True,
         "total_messages": len(message_store),
         "incident_running": incident_running,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": get_iso_now(),
     })
 
 
 @app.route(route="messages", methods=["GET", "OPTIONS"])
 def get_messages(req: func.HttpRequest) -> func.HttpResponse:
-    """Frontend polls this every 1.5s for incremental agent messages"""
+    """Frontend polls this every 1.5s for incremental agent messages."""
     if req.method == "OPTIONS":
         return cors_preflight()
 
-    since_param = req.params.get("since", "0")
     try:
-        since_idx = int(since_param)
+        since_idx = int(req.params.get("since", "0"))
     except ValueError:
         since_idx = 0
 
-    # Clamp to valid range
     since_idx = max(0, min(since_idx, len(message_store)))
     new_messages = message_store[since_idx:]
 
@@ -792,52 +790,58 @@ def get_incident_detail(req: func.HttpRequest) -> func.HttpResponse:
 # ── Target App Proxies ───────────────────────────────────
 
 @app.route(route="inject", methods=["POST", "OPTIONS"])
-def api_inject(req: func.HttpRequest) -> func.HttpResponse:
-    """Shortcut to inject chaos into target app"""
+async def api_inject(req: func.HttpRequest) -> func.HttpResponse:
+    """Shortcut to inject chaos into target app."""
     if req.method == "OPTIONS":
         return cors_preflight()
-    import httpx
     try:
-        resp = httpx.post(f"{TARGET_APP_URL}/chaos/inject", timeout=10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{TARGET_APP_URL}/chaos/inject")
         return make_response(resp.json(), status_code=resp.status_code)
     except Exception as e:
-        return make_response({"error": str(e), "target_url": TARGET_APP_URL}, status_code=502)
+        return make_response(
+            {"error": str(e), "target_url": TARGET_APP_URL},
+            status_code=502,
+        )
 
 
 @app.route(route="fix", methods=["POST", "OPTIONS"])
-def api_fix(req: func.HttpRequest) -> func.HttpResponse:
-    """Shortcut to manually fix target app"""
+async def api_fix(req: func.HttpRequest) -> func.HttpResponse:
+    """Shortcut to manually fix target app."""
     if req.method == "OPTIONS":
         return cors_preflight()
-    import httpx
     try:
-        resp = httpx.post(f"{TARGET_APP_URL}/chaos/fix", timeout=10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{TARGET_APP_URL}/chaos/fix")
         return make_response(resp.json(), status_code=resp.status_code)
     except Exception as e:
         return make_response({"error": str(e)}, status_code=502)
 
 
 @app.route(route="target/health", methods=["GET", "OPTIONS"])
-def api_target_health(req: func.HttpRequest) -> func.HttpResponse:
-    """Proxy to target app /health"""
+async def api_target_health(req: func.HttpRequest) -> func.HttpResponse:
+    """Proxy to target app /health."""
     if req.method == "OPTIONS":
         return cors_preflight()
-    import httpx
     try:
-        resp = httpx.get(f"{TARGET_APP_URL}/health", timeout=10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{TARGET_APP_URL}/health")
         return make_response(resp.json(), status_code=resp.status_code)
     except Exception as e:
-        return make_response({"error": str(e), "status": "unreachable"}, status_code=502)
+        return make_response(
+            {"error": str(e), "status": "unreachable"},
+            status_code=502,
+        )
 
 
 @app.route(route="target/metrics", methods=["GET", "OPTIONS"])
-def api_target_metrics(req: func.HttpRequest) -> func.HttpResponse:
-    """Proxy to target app /metrics"""
+async def api_target_metrics(req: func.HttpRequest) -> func.HttpResponse:
+    """Proxy to target app /metrics."""
     if req.method == "OPTIONS":
         return cors_preflight()
-    import httpx
     try:
-        resp = httpx.get(f"{TARGET_APP_URL}/metrics", timeout=10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{TARGET_APP_URL}/metrics")
         return make_response(resp.json(), status_code=resp.status_code)
     except Exception as e:
         return make_response({"error": str(e)}, status_code=502)
@@ -851,8 +855,8 @@ def api_target_metrics(req: func.HttpRequest) -> func.HttpResponse:
 async def run_incident(req: func.HttpRequest) -> func.HttpResponse:
     """
     Triggers the complete autonomous incident lifecycle:
-      1. Inject bug → 2. Detect → 3. Triage → 4. Diagnose →
-      5. Debate → 6. Fix → 7. Deploy → 8. Postmortem
+      1. Inject bug -> 2. Detect -> 3. Triage -> 4. Diagnose ->
+      5. Debate -> 6. Fix -> 7. Deploy -> 8. Postmortem
     """
     if req.method == "OPTIONS":
         return cors_preflight()
@@ -865,10 +869,9 @@ async def run_incident(req: func.HttpRequest) -> func.HttpResponse:
             status_code=409,
         )
 
-    incident_id = f"INC-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    incident_id = f"INC-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
     logger.info(f"▶ Starting incident lifecycle: {incident_id}")
 
-    # Clear previous state for clean demo
     message_store.clear()
     incident_store.clear()
     incident_running = True
@@ -885,12 +888,11 @@ async def run_incident(req: func.HttpRequest) -> func.HttpResponse:
 # ═══════════════════════════════════════════════════════════
 
 async def run_full_incident(incident_id: str) -> dict:
-    """Execute the complete autonomous incident resolution pipeline"""
-    import httpx
+    """Execute the complete autonomous incident resolution pipeline."""
     global incident_running
 
     target = TARGET_APP_URL
-    start_time = datetime.utcnow()
+    start_time = datetime.now(timezone.utc)
     scenario = random.choice(INCIDENT_SCENARIOS)
     incident_type = scenario["type"]
     incident_context = {
@@ -898,560 +900,623 @@ async def run_full_incident(incident_id: str) -> dict:
         "incident_type": incident_type,
     }
 
-    # ═══════════════════════════════════════════════════
-    # PHASE 1: ORCHESTRATOR — Start Lifecycle
-    # ═══════════════════════════════════════════════════
-    add_message(
-        sender="OrchestratorAgent",
-        recipient="broadcast",
-        msg_type="status",
-        channel="system.status",
-        incident_id=incident_id,
-        payload={
-            "status": "INCIDENT_LIFECYCLE_STARTED",
-            "incident_id": incident_id,
-            "started_at": start_time.isoformat() + "Z",
-            "agents_activated": [
-                "WatcherAgent", "TriageAgent", "DiagnosisAgent",
-                "ResolutionAgent", "DeployAgent", "PostmortemAgent",
-            ],
-            "incident_type": incident_type,
-            "scenario_description": scenario["description"],
-        },
-    )
+    # Pre-declare all variables so they are available in every code path
+    error_rate = 0.0
+    avg_latency = 0.0
+    conn_util = 0.0
+    active_conn = 0
+    max_conn = 20
+    health_data: dict = {}
+    triage_data: dict = {
+        "severity": "P1",
+        "classification": "SERVICE_DEGRADATION",
+        "blast_radius_pct": 42,
+    }
+    diagnosis_data: dict = {}
+    fix_data: dict = {}
+    is_challenge = False
+    fix_applied = False
+    health_status = "UNKNOWN"
+    pr_url = ""
+    rc_text = ""
+    elapsed = 0.0
 
-    add_message(
-        sender="WatcherAgent",
-        recipient="Dashboard",
-        msg_type="status",
-        channel="incident.detection",
-        incident_id=incident_id,
-        payload={
-            "agent": "WatcherAgent",
-            "stage": "DETECT",
-            "message": f"Anomaly detected: {scenario['description']}",
-            "metrics": scenario["symptoms"],
-            "incident_type": incident_type,
-        },
-    )
+    try:
+        # ═══════════════════════════════════════════════════
+        # PHASE 1: ORCHESTRATOR — Start Lifecycle
+        # ═══════════════════════════════════════════════════
+        add_message(
+            sender="OrchestratorAgent",
+            recipient="broadcast",
+            msg_type="status",
+            channel="system.status",
+            incident_id=incident_id,
+            payload={
+                "status": "INCIDENT_LIFECYCLE_STARTED",
+                "incident_id": incident_id,
+                "started_at": start_time.isoformat().replace("+00:00", "Z"),
+                "agents_activated": [
+                    "WatcherAgent", "TriageAgent", "DiagnosisAgent",
+                    "ResolutionAgent", "DeployAgent", "PostmortemAgent",
+                ],
+                "incident_type": incident_type,
+                "scenario_description": scenario["description"],
+            },
+        )
 
-    send_stage("DETECT", incident_id)
-    await asyncio.sleep(1)
+        add_message(
+            sender="WatcherAgent",
+            recipient="Dashboard",
+            msg_type="status",
+            channel="incident.detection",
+            incident_id=incident_id,
+            payload={
+                "agent": "WatcherAgent",
+                "stage": "DETECT",
+                "message": f"Anomaly detected: {scenario['description']}",
+                "metrics": scenario["symptoms"],
+                "incident_type": incident_type,
+            },
+        )
 
-    # ═══════════════════════════════════════════════════
-    # PHASE 2: INJECT BUG + GENERATE LOAD
-    # ═══════════════════════════════════════════════════
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            resp = await client.post(f"{target}/chaos/inject")
-            logger.info(f"Bug injected: {resp.status_code}")
-        except Exception as e:
-            logger.error(f"Failed to inject bug: {e}")
+        send_stage("DETECT", incident_id)
+        await asyncio.sleep(1)
 
-        # Generate load to trigger pool exhaustion faster
-        for _ in range(5):
+        # ═══════════════════════════════════════════════════
+        # PHASE 2: INJECT BUG + GENERATE LOAD
+        # ═══════════════════════════════════════════════════
+        async with httpx.AsyncClient(timeout=30) as client:
             try:
-                await client.post(f"{target}/chaos/generate-load")
+                resp = await client.post(f"{target}/chaos/inject")
+                logger.info(f"Bug injected: {resp.status_code}")
+            except Exception as e:
+                logger.error(f"Failed to inject bug: {e}")
+
+            for _ in range(5):
+                try:
+                    await client.post(f"{target}/chaos/generate-load")
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+            # ═══════════════════════════════════════════════
+            # PHASE 3: WATCHER AGENT — Detect Anomaly
+            # ═══════════════════════════════════════════════
+            metrics_data: dict = {}
+
+            try:
+                resp = await client.get(f"{target}/health")
+                health_data = resp.json()
             except Exception:
-                pass
-            await asyncio.sleep(1)
+                health_data = {"status": "unreachable", "bug_injected": True}
 
-        # ═══════════════════════════════════════════════
-        # PHASE 3: WATCHER AGENT — Detect Anomaly
-        # ═══════════════════════════════════════════════
-        health_data = {}
-        metrics_data = {}
-
-        try:
-            resp = await client.get(f"{target}/health")
-            health_data = resp.json()
-        except Exception:
-            health_data = {"status": "unreachable", "bug_injected": True}
-
-        try:
-            resp = await client.get(f"{target}/metrics")
-            metrics_data = resp.json()
-        except Exception:
-            metrics_data = {
-                "connection_utilization": 0.9,
-                "active_connections": 18,
-                "max_connections": 20,
-            }
-
-        # Synthetic error rate measurement
-        error_count = 0
-        total_latency = 0.0
-        for _ in range(5):
             try:
-                t0 = asyncio.get_event_loop().time()
-                resp = await client.get(f"{target}/tasks")
-                t1 = asyncio.get_event_loop().time()
-                total_latency += (t1 - t0) * 1000
-                if resp.status_code >= 500:
+                resp = await client.get(f"{target}/metrics")
+                metrics_data = resp.json()
+            except Exception:
+                metrics_data = {
+                    "connection_utilization": 0.9,
+                    "active_connections": 18,
+                    "max_connections": 20,
+                }
+
+            error_count = 0
+            total_latency = 0.0
+            loop = asyncio.get_running_loop()
+            for _ in range(5):
+                try:
+                    t0 = loop.time()
+                    resp = await client.get(f"{target}/tasks")
+                    t1 = loop.time()
+                    total_latency += (t1 - t0) * 1000
+                    if resp.status_code >= 500:
+                        error_count += 1
+                except Exception:
                     error_count += 1
-            except Exception:
-                error_count += 1
-                total_latency += 1000  # assume 1s timeout
+                    total_latency += 1000
 
-    error_rate = error_count / 5
-    avg_latency = total_latency / 5
-    conn_util = metrics_data.get("connection_utilization", 0)
-    active_conn = metrics_data.get("active_connections", 0)
-    max_conn = metrics_data.get("max_connections", 20)
+        error_rate = error_count / 5
+        avg_latency = total_latency / 5
+        conn_util = metrics_data.get("connection_utilization", 0)
+        active_conn = metrics_data.get("active_connections", 0)
+        max_conn = metrics_data.get("max_connections", 20)
 
-    # Broadcast monitoring status (frontend reads this for metric cards)
-    add_message(
-        sender="WatcherAgent",
-        recipient="Dashboard",
-        msg_type="status",
-        channel="monitoring.status",
-        incident_id=incident_id,
-        payload={
-            "error_rate": error_rate,
-            "active_connections": active_conn,
-            "max_connections": max_conn,
-            "connection_utilization": conn_util,
-            "avg_response_time_ms": avg_latency,
-        },
-    )
-
-    add_message(
-        sender="WatcherAgent",
-        recipient="OrchestratorAgent",
-        msg_type="alert",
-        channel="incident.detection",
-        incident_id=incident_id,
-        payload={
-            "alert_type": "ANOMALY_DETECTED",
-            "data": {
+        add_message(
+            sender="WatcherAgent",
+            recipient="Dashboard",
+            msg_type="status",
+            channel="monitoring.status",
+            incident_id=incident_id,
+            payload={
                 "error_rate": error_rate,
-                "baseline_error_rate": 0.005,
-                "connection_utilization": conn_util,
                 "active_connections": active_conn,
                 "max_connections": max_conn,
+                "connection_utilization": conn_util,
                 "avg_response_time_ms": avg_latency,
             },
-            "affected_services": ["target-app"],
-            "detected_at": datetime.utcnow().isoformat() + "Z",
-        },
-        confidence=0.94,
-        evidence=[
-            f"Error rate: {error_rate*100:.1f}% (baseline: 0.5%)",
-            f"Connection utilization: {conn_util*100:.1f}%",
-            f"Active connections: {active_conn}/{max_conn}",
-            f"Avg response time: {avg_latency:.0f}ms",
-        ],
-    )
-    send_stage("TRIAGE", incident_id)
-    await asyncio.sleep(1)
+        )
 
-    # ═══════════════════════════════════════════════════
-    # PHASE 4: TRIAGE AGENT — Classify Severity
-    # ═══════════════════════════════════════════════════
-    triage_system = (
-        "You are TriageAgent, an expert SRE incident triage specialist. "
-        "Classify this incident's severity.\n"
-        "P0=critical outage >80% affected, P1=high >30%, P2=medium <30%, P3=low <5%\n"
-        "Respond ONLY with valid JSON:\n"
-        "{\"severity\": \"P0-P3\", \"classification\": \"string\", "
-        "\"blast_radius_pct\": number, \"affected_endpoints\": [strings], "
-        "\"auto_resolve_eligible\": boolean, \"escalate_to_human\": boolean, "
-        "\"reasoning\": \"string\"}"
-    )
-    triage_user = (
-        f"Alert data:\n"
-        f"- Error rate: {error_rate*100:.1f}% (baseline: 0.5%)\n"
-        f"- Connection utilization: {conn_util*100:.1f}%\n"
-        f"- Active connections: {active_conn}/{max_conn}\n"
-        f"- Avg response time: {avg_latency:.0f}ms\n"
-        f"- Affected service: TaskManager API\n"
-        f"Classify this incident."
-    )
-    triage_raw = await chat_llm(triage_system, triage_user)
-    triage_data = parse_json_response(triage_raw)
-    triage_data.setdefault("severity", "P1")
-    triage_data.setdefault("classification", "SERVICE_DEGRADATION")
-    triage_data.setdefault("blast_radius_pct", 42)
+        add_message(
+            sender="WatcherAgent",
+            recipient="OrchestratorAgent",
+            msg_type="alert",
+            channel="incident.detection",
+            incident_id=incident_id,
+            payload={
+                "alert_type": "ANOMALY_DETECTED",
+                "data": {
+                    "error_rate": error_rate,
+                    "baseline_error_rate": 0.005,
+                    "connection_utilization": conn_util,
+                    "active_connections": active_conn,
+                    "max_connections": max_conn,
+                    "avg_response_time_ms": avg_latency,
+                },
+                "affected_services": ["target-app"],
+                "detected_at": get_iso_now(),
+            },
+            confidence=0.94,
+            evidence=[
+                f"Error rate: {error_rate * 100:.1f}% (baseline: 0.5%)",
+                f"Connection utilization: {conn_util * 100:.1f}%",
+                f"Active connections: {active_conn}/{max_conn}",
+                f"Avg response time: {avg_latency:.0f}ms",
+            ],
+        )
+        send_stage("TRIAGE", incident_id)
+        await asyncio.sleep(1)
 
-    add_message(
-        sender="TriageAgent",
-        recipient="OrchestratorAgent",
-        msg_type="analysis",
-        channel="incident.triage",
-        incident_id=incident_id,
-        payload=triage_data,
-        confidence=0.91,
-    )
-    send_stage("DIAGNOSE", incident_id)
-    await asyncio.sleep(1)
-
-    # ═══════════════════════════════════════════════════
-    # PHASE 5: DIAGNOSIS AGENT — Root Cause Analysis
-    # ═══════════════════════════════════════════════════
-    diagnosis_system = (
-        "You are DiagnosisAgent, an expert SRE root cause analyst. "
-        "The target app is a Python FastAPI app with:\n"
-        "- ConnectionPool class (max 20 connections)\n"
-        "- acquire() and release() methods\n"
-        "- /tasks endpoints that use the pool\n"
-        "- A finally block that should release connections\n"
-        "- /chaos/inject endpoint that activates a bug\n"
-        "Respond ONLY with valid JSON:\n"
-        "{\"root_cause\": {\"category\": \"string\", \"component\": \"string\", "
-        "\"file\": \"string\", \"function\": \"string\", \"mechanism\": \"string\", "
-        "\"detail\": \"string\"}, \"confidence\": number, "
-        "\"evidence_analysis\": [strings], \"alternative_hypotheses\": [objects]}"
-    )
-    diagnosis_user = (
-        f"Incident scenario detected.\n\n"
-        f"Type: {scenario['type']}\n"
-        f"Description: {scenario['description']}\n"
-        f"Symptoms: {scenario['symptoms']}\n\n"
-        f"Analyze the root cause and propose a fix.\n\n"
-        f"Incident data:\n"
-        f"- Severity: {triage_data.get('severity', 'P1')}\n"
-        f"- Error rate: {error_rate*100:.1f}%\n"
-        f"- Connections: {active_conn}/{max_conn}\n"
-        f"- Utilization: {conn_util*100:.1f}%\n"
-        f"- Avg response time: {avg_latency:.0f}ms\n"
-        f"- Bug injected: {health_data.get('bug_injected', 'unknown')}\n"
-        f"Find the root cause."
-    )
-    diagnosis_raw = await chat_llm(diagnosis_system, diagnosis_user)
-    diagnosis_data = parse_json_response(diagnosis_raw)
-    if "root_cause" not in diagnosis_data:
-        diagnosis_data = {"root_cause": diagnosis_data, "confidence": 0.85}
-
-    add_message(
-        sender="DiagnosisAgent",
-        recipient="ResolutionAgent",
-        msg_type="analysis",
-        channel="incident.diagnosis",
-        incident_id=incident_id,
-        payload=diagnosis_data,
-        confidence=diagnosis_data.get("confidence", 0.88),
-        evidence=diagnosis_data.get("evidence_analysis", []),
-    )
-    send_stage("DEBATE", incident_id)
-    await asyncio.sleep(1)
-
-    # ═══════════════════════════════════════════════════
-    # PHASE 6: RESOLUTION AGENT — Devil's Advocate Debate
-    # ═══════════════════════════════════════════════════
-    debate_system = (
-        "You are ResolutionAgent. Before generating a fix, you MUST critically "
-        "evaluate the diagnosis by playing devil's advocate.\n"
-        "Ask: Is this REALLY the root cause? Could it be something else?\n"
-        "Respond ONLY with valid JSON:\n"
-        "{\"assessment\": \"AGREE\" or \"CHALLENGE\", \"reasoning\": \"string\", "
-        "\"challenge_question\": \"string\", \"alternative_hypothesis\": \"string\", "
-        "\"confidence_in_diagnosis\": number}"
-    )
-    if scenario["type"] == "memory_leak":
-        challenge_reason = "Could this memory growth be caused by unbounded caching rather than database usage?"
-    elif scenario["type"] == "slow_database_queries":
-        challenge_reason = "Could slow queries be causing resource contention rather than connection leaks?"
-    elif scenario["type"] == "external_api_failure":
-        challenge_reason = "Could upstream API failures be propagating errors through the service?"
-    elif scenario["type"] == "cache_failure":
-        challenge_reason = "Is the database overloaded due to cache misses?"
-    else:
-        challenge_reason = "Could slow queries be holding connections longer than expected?"
-
-    debate_user = (
-        f"Incident scenario:\n"
-        f"- Type: {scenario['type']}\n"
-        f"- Description: {scenario['description']}\n"
-        f"- Suggested challenge angle: {challenge_reason}\n\n"
-        f"Diagnosis from DiagnosisAgent:\n"
-        f"{json.dumps(diagnosis_data, indent=2)}\n\n"
-        f"Critically evaluate this diagnosis. Be skeptical."
-    )
-    debate_raw = await chat_llm(debate_system, debate_user)
-    debate_data = parse_json_response(debate_raw)
-    is_challenge = debate_data.get("assessment", "").upper() == "CHALLENGE"
-
-    add_message(
-        sender="ResolutionAgent",
-        recipient="DiagnosisAgent",
-        msg_type="challenge" if is_challenge else "consensus",
-        channel="incident.debate",
-        incident_id=incident_id,
-        payload={
-            "evaluation": debate_data,
-            "challenge_reason": challenge_reason,
-            "debate_round": 1,
-            "debate_concluded": not is_challenge,
-        },
-        confidence=debate_data.get("confidence_in_diagnosis", 0.7 if is_challenge else 0.9),
-    )
-
-    # ── If challenged → Defense → Final consensus ───────
-    if is_challenge:
-        defense_system = (
-            "You are DiagnosisAgent responding to a challenge from ResolutionAgent. "
-            "Be intellectually honest. If they have a valid point, acknowledge it. "
-            "If your diagnosis is correct, defend with specific evidence.\n"
+        # ═══════════════════════════════════════════════════
+        # PHASE 4: TRIAGE AGENT — Classify Severity
+        # ═══════════════════════════════════════════════════
+        triage_system = (
+            "You are TriageAgent, an expert SRE incident triage specialist. "
+            "Classify this incident's severity.\n"
+            "P0=critical outage >80% affected, P1=high >30%, P2=medium <30%, P3=low <5%\n"
             "Respond ONLY with valid JSON:\n"
-            "{\"response_type\": \"DEFEND\" or \"ACCEPT_REVISION\", "
-            "\"response\": \"string\", \"additional_evidence\": [strings], "
-            "\"confidence\": number}"
+            "{\"severity\": \"P0-P3\", \"classification\": \"string\", "
+            "\"blast_radius_pct\": number, \"affected_endpoints\": [strings], "
+            "\"auto_resolve_eligible\": boolean, \"escalate_to_human\": boolean, "
+            "\"reasoning\": \"string\"}"
         )
-        defense_user = (
-            f"ResolutionAgent's challenge:\n"
-            f"{debate_data.get('reasoning', 'No reasoning provided')}\n\n"
-            f"Challenge question: {debate_data.get('challenge_question', 'N/A')}\n\n"
-            f"Your original diagnosis:\n"
-            f"{json.dumps(diagnosis_data.get('root_cause', {}), indent=2)}\n\n"
-            f"Defend or revise your diagnosis with concrete evidence."
+        triage_user = (
+            f"Alert data:\n"
+            f"- Error rate: {error_rate * 100:.1f}% (baseline: 0.5%)\n"
+            f"- Connection utilization: {conn_util * 100:.1f}%\n"
+            f"- Active connections: {active_conn}/{max_conn}\n"
+            f"- Avg response time: {avg_latency:.0f}ms\n"
+            f"- Affected service: TaskManager API\n"
+            f"Classify this incident."
         )
-        defense_raw = await chat_llm(defense_system, defense_user)
-        defense_data = parse_json_response(defense_raw)
+        triage_raw = await chat_llm(triage_system, triage_user)
+        triage_data = parse_json_response(triage_raw)
+        triage_data.setdefault("severity", "P1")
+        triage_data.setdefault("classification", "SERVICE_DEGRADATION")
+        triage_data.setdefault("blast_radius_pct", 42)
+
+        add_message(
+            sender="TriageAgent",
+            recipient="OrchestratorAgent",
+            msg_type="analysis",
+            channel="incident.triage",
+            incident_id=incident_id,
+            payload=triage_data,
+            confidence=0.91,
+        )
+        send_stage("DIAGNOSE", incident_id)
+        await asyncio.sleep(1)
+
+        # ═══════════════════════════════════════════════════
+        # PHASE 5: DIAGNOSIS AGENT — Root Cause Analysis
+        # ═══════════════════════════════════════════════════
+        diagnosis_system = (
+            "You are DiagnosisAgent, an expert SRE root cause analyst. "
+            "The target app is a Python FastAPI app with:\n"
+            "- ConnectionPool class (max 20 connections)\n"
+            "- acquire() and release() methods\n"
+            "- /tasks endpoints that use the pool\n"
+            "- A finally block that should release connections\n"
+            "- /chaos/inject endpoint that activates a bug\n"
+            "Respond ONLY with valid JSON:\n"
+            "{\"root_cause\": {\"category\": \"string\", \"component\": \"string\", "
+            "\"file\": \"string\", \"function\": \"string\", \"mechanism\": \"string\", "
+            "\"detail\": \"string\"}, \"confidence\": number, "
+            "\"evidence_analysis\": [strings], \"alternative_hypotheses\": [objects]}"
+        )
+        diagnosis_user = (
+            f"Incident scenario detected.\n\n"
+            f"Type: {scenario['type']}\n"
+            f"Description: {scenario['description']}\n"
+            f"Symptoms: {scenario['symptoms']}\n\n"
+            f"Analyze the root cause and propose a fix.\n\n"
+            f"Incident data:\n"
+            f"- Severity: {triage_data.get('severity', 'P1')}\n"
+            f"- Error rate: {error_rate * 100:.1f}%\n"
+            f"- Connections: {active_conn}/{max_conn}\n"
+            f"- Utilization: {conn_util * 100:.1f}%\n"
+            f"- Avg response time: {avg_latency:.0f}ms\n"
+            f"- Bug injected: {health_data.get('bug_injected', 'unknown')}\n"
+            f"Find the root cause."
+        )
+        diagnosis_raw = await chat_llm(diagnosis_system, diagnosis_user)
+        diagnosis_data = parse_json_response(diagnosis_raw)
+        if "root_cause" not in diagnosis_data:
+            diagnosis_data = {"root_cause": diagnosis_data, "confidence": 0.85}
 
         add_message(
             sender="DiagnosisAgent",
             recipient="ResolutionAgent",
-            msg_type="evidence",
-            channel="incident.debate",
+            msg_type="analysis",
+            channel="incident.diagnosis",
             incident_id=incident_id,
-            payload={
-                **defense_data,
-                "debate_round": 2,
-            },
-            confidence=defense_data.get("confidence", 0.94),
+            payload=diagnosis_data,
+            confidence=diagnosis_data.get("confidence", 0.88),
+            evidence=diagnosis_data.get("evidence_analysis", []),
         )
+        send_stage("DEBATE", incident_id)
+        await asyncio.sleep(1)
 
-        # Final consensus after defense
+        # ═══════════════════════════════════════════════════
+        # PHASE 6: RESOLUTION AGENT — Devil's Advocate Debate
+        # ═══════════════════════════════════════════════════
+        debate_system = (
+            "You are ResolutionAgent. Before generating a fix, you MUST critically "
+            "evaluate the diagnosis by playing devil's advocate.\n"
+            "Ask: Is this REALLY the root cause? Could it be something else?\n"
+            "Respond ONLY with valid JSON:\n"
+            "{\"assessment\": \"AGREE\" or \"CHALLENGE\", \"reasoning\": \"string\", "
+            "\"challenge_question\": \"string\", \"alternative_hypothesis\": \"string\", "
+            "\"confidence_in_diagnosis\": number}"
+        )
+        if scenario["type"] == "memory_leak":
+            challenge_reason = "Could this memory growth be caused by unbounded caching rather than database usage?"
+        elif scenario["type"] == "slow_database_queries":
+            challenge_reason = "Could slow queries be causing resource contention rather than connection leaks?"
+        elif scenario["type"] == "external_api_failure":
+            challenge_reason = "Could upstream API failures be propagating errors through the service?"
+        elif scenario["type"] == "cache_failure":
+            challenge_reason = "Is the database overloaded due to cache misses?"
+        else:
+            challenge_reason = "Could slow queries be holding connections longer than expected?"
+
+        debate_user = (
+            f"Incident scenario:\n"
+            f"- Type: {scenario['type']}\n"
+            f"- Description: {scenario['description']}\n"
+            f"- Suggested challenge angle: {challenge_reason}\n\n"
+            f"Diagnosis from DiagnosisAgent:\n"
+            f"{json.dumps(diagnosis_data, indent=2)}\n\n"
+            f"Critically evaluate this diagnosis. Be skeptical."
+        )
+        debate_raw = await chat_llm(debate_system, debate_user)
+        debate_data = parse_json_response(debate_raw)
+        is_challenge = debate_data.get("assessment", "").upper() == "CHALLENGE"
+
         add_message(
             sender="ResolutionAgent",
-            recipient="OrchestratorAgent",
-            msg_type="consensus",
+            recipient="DiagnosisAgent",
+            msg_type="challenge" if is_challenge else "consensus",
             channel="incident.debate",
             incident_id=incident_id,
             payload={
-                "evaluation": {
-                    "assessment": "AGREE",
-                    "reasoning": (
-                        "After reviewing DiagnosisAgent's additional evidence — "
-                        "particularly the connection hold time data showing 847ms "
-                        "in error paths vs 10ms normal — the connection pool leak "
-                        "diagnosis is confirmed with high confidence. "
-                        "Proceeding with fix generation."
-                    ),
-                    "confidence_in_diagnosis": 0.94,
-                },
-                "debate_round": 3,
-                "debate_concluded": True,
+                "evaluation": debate_data,
+                "challenge_reason": challenge_reason,
+                "debate_round": 1,
+                "debate_concluded": not is_challenge,
             },
-            confidence=0.94,
+            confidence=debate_data.get(
+                "confidence_in_diagnosis", 0.7 if is_challenge else 0.9
+            ),
         )
 
-    # ═══════════════════════════════════════════════════
-    # PHASE 7: RESOLUTION AGENT — Generate Code Fix
-    # ═══════════════════════════════════════════════════
-    fix_system = (
-        "You are ResolutionAgent generating a targeted code fix. Rules:\n"
-        "1. Fix ONLY the specific bug identified — no refactoring\n"
-        "2. Generate a unified diff showing before/after\n"
-        "3. Add a clear comment explaining the fix\n"
-        "4. Assess the risk level (LOW/MEDIUM/HIGH)\n"
-        "Respond ONLY with valid JSON:\n"
-        "{\"fix\": {\"file\": \"string\", \"description\": \"string\", "
-        "\"diff\": \"string\", \"risk_level\": \"LOW|MEDIUM|HIGH\", "
-        "\"explanation\": \"string\", \"lines_changed\": number}, "
-        "\"validation_steps\": [strings]}"
-    )
-    fix_user = (
-        f"Incident scenario:\n"
-        f"- Type: {scenario['type']}\n"
-        f"- Description: {scenario['description']}\n"
-        f"- Expected root cause context: {scenario.get('root_cause', '')}\n\n"
-        f"Confirmed root cause:\n"
-        f"{json.dumps(diagnosis_data.get('root_cause', {}), indent=2)}\n\n"
-        f"Generate a minimal, safe code fix."
-    )
-    fix_raw = await chat_llm(fix_system, fix_user)
-    fix_data = parse_json_response(fix_raw)
-    if "fix" not in fix_data:
-        fix_data = {"fix": fix_data}
+        if is_challenge:
+            defense_system = (
+                "You are DiagnosisAgent responding to a challenge from ResolutionAgent. "
+                "Be intellectually honest. If they have a valid point, acknowledge it. "
+                "If your diagnosis is correct, defend with specific evidence.\n"
+                "Respond ONLY with valid JSON:\n"
+                "{\"response_type\": \"DEFEND\" or \"ACCEPT_REVISION\", "
+                "\"response\": \"string\", \"additional_evidence\": [strings], "
+                "\"confidence\": number}"
+            )
+            defense_user = (
+                f"ResolutionAgent's challenge:\n"
+                f"{debate_data.get('reasoning', 'No reasoning provided')}\n\n"
+                f"Challenge question: {debate_data.get('challenge_question', 'N/A')}\n\n"
+                f"Your original diagnosis:\n"
+                f"{json.dumps(diagnosis_data.get('root_cause', {}), indent=2)}\n\n"
+                f"Defend or revise your diagnosis with concrete evidence."
+            )
+            defense_raw = await chat_llm(defense_system, defense_user)
+            defense_data = parse_json_response(defense_raw)
 
-    add_message(
-        sender="ResolutionAgent",
-        recipient="DeployAgent",
-        msg_type="proposal",
-        channel="incident.resolution",
-        incident_id=incident_id,
-        payload=fix_data,
-        confidence=0.92,
-    )
-    send_stage("DEPLOY", incident_id)
-    await asyncio.sleep(1)
+            add_message(
+                sender="DiagnosisAgent",
+                recipient="ResolutionAgent",
+                msg_type="evidence",
+                channel="incident.debate",
+                incident_id=incident_id,
+                payload={
+                    **defense_data,
+                    "debate_round": 2,
+                },
+                confidence=defense_data.get("confidence", 0.94),
+            )
 
-    # ═══════════════════════════════════════════════════
-    # PHASE 8: DEPLOY AGENT — Apply Fix + Verify + PR
-    # ═══════════════════════════════════════════════════
-    fix_applied = False
-    health_status = "UNKNOWN"
+            add_message(
+                sender="ResolutionAgent",
+                recipient="OrchestratorAgent",
+                msg_type="consensus",
+                channel="incident.debate",
+                incident_id=incident_id,
+                payload={
+                    "evaluation": {
+                        "assessment": "AGREE",
+                        "reasoning": (
+                            "After reviewing DiagnosisAgent's additional evidence — "
+                            "particularly the connection hold time data showing 847ms "
+                            "in error paths vs 10ms normal — the connection pool leak "
+                            "diagnosis is confirmed with high confidence. "
+                            "Proceeding with fix generation."
+                        ),
+                        "confidence_in_diagnosis": 0.94,
+                    },
+                    "debate_round": 3,
+                    "debate_concluded": True,
+                },
+                confidence=0.94,
+            )
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        # Apply fix to target app
-        try:
-            resp = await client.post(f"{target}/chaos/fix")
-            fix_applied = resp.status_code == 200
-            logger.info(f"Fix applied: {fix_applied}")
-        except Exception as e:
-            logger.error(f"Failed to apply fix: {e}")
+        # ═══════════════════════════════════════════════════
+        # PHASE 7: RESOLUTION AGENT — Generate Code Fix
+        # ═══════════════════════════════════════════════════
+        fix_system = (
+            "You are ResolutionAgent generating a targeted code fix. Rules:\n"
+            "1. Fix ONLY the specific bug identified — no refactoring\n"
+            "2. Generate a unified diff showing before/after\n"
+            "3. Add a clear comment explaining the fix\n"
+            "4. Assess the risk level (LOW/MEDIUM/HIGH)\n"
+            "Respond ONLY with valid JSON:\n"
+            "{\"fix\": {\"file\": \"string\", \"description\": \"string\", "
+            "\"diff\": \"string\", \"risk_level\": \"LOW|MEDIUM|HIGH\", "
+            "\"explanation\": \"string\", \"lines_changed\": number}, "
+            "\"validation_steps\": [strings]}"
+        )
+        fix_user = (
+            f"Incident scenario:\n"
+            f"- Type: {scenario['type']}\n"
+            f"- Description: {scenario['description']}\n"
+            f"- Expected root cause context: {scenario.get('root_cause', '')}\n\n"
+            f"Confirmed root cause:\n"
+            f"{json.dumps(diagnosis_data.get('root_cause', {}), indent=2)}\n\n"
+            f"Generate a minimal, safe code fix."
+        )
+        fix_raw = await chat_llm(fix_system, fix_user)
+        fix_data = parse_json_response(fix_raw)
+        if "fix" not in fix_data:
+            fix_data = {"fix": fix_data}
 
-        # Verify health with retries
-        for attempt in range(5):
+        add_message(
+            sender="ResolutionAgent",
+            recipient="DeployAgent",
+            msg_type="proposal",
+            channel="incident.resolution",
+            incident_id=incident_id,
+            payload=fix_data,
+            confidence=0.92,
+        )
+        send_stage("DEPLOY", incident_id)
+        await asyncio.sleep(1)
+
+        # ═══════════════════════════════════════════════════
+        # PHASE 8: DEPLOY AGENT — Apply Fix + Verify + PR
+        # ═══════════════════════════════════════════════════
+        async with httpx.AsyncClient(timeout=30) as client:
             try:
-                await asyncio.sleep(1)
-                resp = await client.get(f"{target}/health")
-                health = resp.json()
-                active = health.get("active_connections", 99)
-                if active < 5:
-                    health_status = "HEALTHY"
-                    break
-                health_status = "RECOVERING" if active < 15 else "DEGRADED"
-            except Exception:
-                health_status = "UNKNOWN"
+                resp = await client.post(f"{target}/chaos/fix")
+                fix_applied = resp.status_code == 200
+                logger.info(f"Fix applied: {fix_applied}")
+            except Exception as e:
+                logger.error(f"Failed to apply fix: {e}")
 
-    # Create GitHub PR (non-blocking best-effort)
-    rc_detail = diagnosis_data.get("root_cause", {})
-    rc_text = rc_detail.get("detail", "connection pool leak") if isinstance(rc_detail, dict) else str(rc_detail)
-    pr_url = await create_github_pr(incident_id, fix_data, rc_text)
+            for _ in range(5):
+                try:
+                    await asyncio.sleep(1)
+                    resp = await client.get(f"{target}/health")
+                    health = resp.json()
+                    active = health.get("active_connections", 99)
+                    if active < 5:
+                        health_status = "HEALTHY"
+                        break
+                    health_status = "RECOVERING" if active < 15 else "DEGRADED"
+                except Exception:
+                    health_status = "UNKNOWN"
 
-    # Post-fix monitoring status for dashboard metrics
-    add_message(
-        sender="WatcherAgent",
-        recipient="Dashboard",
-        msg_type="status",
-        channel="monitoring.status",
-        incident_id=incident_id,
-        payload={
-            "error_rate": 0.0 if fix_applied else error_rate,
-            "active_connections": 2 if health_status == "HEALTHY" else active_conn,
-            "max_connections": max_conn,
-            "connection_utilization": 0.1 if health_status == "HEALTHY" else conn_util,
-            "avg_response_time_ms": 25.0 if health_status == "HEALTHY" else avg_latency,
-        },
-    )
+        rc_detail = diagnosis_data.get("root_cause", {})
+        rc_text = (
+            rc_detail.get("detail", "connection pool leak")
+            if isinstance(rc_detail, dict)
+            else str(rc_detail)
+        )
+        pr_url = await create_github_pr(incident_id, fix_data, rc_text)
 
-    add_message(
-        sender="DeployAgent",
-        recipient="OrchestratorAgent",
-        msg_type="status",
-        channel="incident.deployment",
-        incident_id=incident_id,
-        payload={
-            "status": "SUCCESS" if fix_applied else "FAILED",
-            "fix_applied": fix_applied,
-            "health_check": health_status,
-            "verification_attempts": 5,
-            "pr_url": pr_url,
-            "deployed_at": datetime.utcnow().isoformat() + "Z",
-        },
-        confidence=0.95 if fix_applied and health_status == "HEALTHY" else 0.3,
-    )
-    send_stage("REPORT", incident_id)
-    await asyncio.sleep(1)
+        add_message(
+            sender="WatcherAgent",
+            recipient="Dashboard",
+            msg_type="status",
+            channel="monitoring.status",
+            incident_id=incident_id,
+            payload={
+                "error_rate": 0.0 if fix_applied else error_rate,
+                "active_connections": 2 if health_status == "HEALTHY" else active_conn,
+                "max_connections": max_conn,
+                "connection_utilization": 0.1 if health_status == "HEALTHY" else conn_util,
+                "avg_response_time_ms": 25.0 if health_status == "HEALTHY" else avg_latency,
+            },
+        )
 
-    # ═══════════════════════════════════════════════════
-    # PHASE 9: POSTMORTEM AGENT — Generate Report
-    # ═══════════════════════════════════════════════════
-    elapsed = (datetime.utcnow() - start_time).total_seconds()
+        add_message(
+            sender="DeployAgent",
+            recipient="OrchestratorAgent",
+            msg_type="status",
+            channel="incident.deployment",
+            incident_id=incident_id,
+            payload={
+                "status": "SUCCESS" if fix_applied else "FAILED",
+                "fix_applied": fix_applied,
+                "health_check": health_status,
+                "verification_attempts": 5,
+                "pr_url": pr_url,
+                "deployed_at": get_iso_now(),
+            },
+            confidence=0.95 if fix_applied and health_status == "HEALTHY" else 0.3,
+        )
+        send_stage("REPORT", incident_id)
+        await asyncio.sleep(1)
 
-    postmortem_system = (
-        "You are PostmortemAgent. Write a professional incident postmortem "
-        "report in markdown format. Include:\n"
-        "1. Executive Summary (2-3 sentences)\n"
-        "2. Timeline with agent actions and timestamps\n"
-        "3. Root Cause Analysis (technical detail)\n"
-        "4. Agent Debate Highlights (CRITICAL — show how ResolutionAgent "
-        "challenged DiagnosisAgent and how the debate improved accuracy)\n"
-        "5. Impact Assessment (table with before/after metrics)\n"
-        "6. Resolution and Fix Details\n"
-        "7. Lessons Learned (3 bullets)\n"
-        "8. Prevention Recommendations (3 bullets)"
-    )
-    postmortem_user = (
-        f"Incident: {incident_id}\n"
-        f"Incident Type: {scenario['type']}\n"
-        f"Scenario Description: {scenario['description']}\n"
-        f"Duration: {elapsed:.0f} seconds\n"
-        f"Severity: {triage_data.get('severity', 'P1')}\n"
-        f"Classification: {triage_data.get('classification', 'SERVICE_DEGRADATION')}\n"
-        f"Blast Radius: {triage_data.get('blast_radius_pct', 42)}%\n"
-        f"Root Cause: {rc_text}\n"
-        f"Expected Scenario Root Cause: {scenario.get('root_cause', '')}\n"
-        f"Debate: ResolutionAgent {'CHALLENGED then reached consensus' if is_challenge else 'agreed immediately'}\n"
-        f"Fix: {fix_data.get('fix', {}).get('description', 'connection release fix')}\n"
-        f"Risk Level: {fix_data.get('fix', {}).get('risk_level', 'LOW')}\n"
-        f"Deployment: {'SUCCESS' if fix_applied else 'FAILED'}\n"
-        f"Health After Fix: {health_status}\n"
-        f"PR URL: {pr_url}\n"
-        f"Total Agent Messages: {len(message_store)}\n"
-        f"LLM Provider: {get_llm_provider()}\n"
-        f"Generate the complete postmortem report."
-    )
-    postmortem_report = await chat_llm(postmortem_system, postmortem_user)
+        # ═══════════════════════════════════════════════════
+        # PHASE 9: POSTMORTEM AGENT — Generate Report
+        # ═══════════════════════════════════════════════════
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
 
-    add_message(
-        sender="PostmortemAgent",
-        recipient="broadcast",
-        msg_type="status",
-        channel="incident.postmortem",
-        incident_id=incident_id,
-        payload={
-            "report_markdown": postmortem_report,
+        postmortem_system = (
+            "You are PostmortemAgent. Write a professional incident postmortem "
+            "report in markdown format. Include:\n"
+            "1. Executive Summary (2-3 sentences)\n"
+            "2. Timeline with agent actions and timestamps\n"
+            "3. Root Cause Analysis (technical detail)\n"
+            "4. Agent Debate Highlights (CRITICAL — show how ResolutionAgent "
+            "challenged DiagnosisAgent and how the debate improved accuracy)\n"
+            "5. Impact Assessment (table with before/after metrics)\n"
+            "6. Resolution and Fix Details\n"
+            "7. Lessons Learned (3 bullets)\n"
+            "8. Prevention Recommendations (3 bullets)"
+        )
+        postmortem_user = (
+            f"Incident: {incident_id}\n"
+            f"Incident Type: {scenario['type']}\n"
+            f"Scenario Description: {scenario['description']}\n"
+            f"Duration: {elapsed:.0f} seconds\n"
+            f"Severity: {triage_data.get('severity', 'P1')}\n"
+            f"Classification: {triage_data.get('classification', 'SERVICE_DEGRADATION')}\n"
+            f"Blast Radius: {triage_data.get('blast_radius_pct', 42)}%\n"
+            f"Root Cause: {rc_text}\n"
+            f"Expected Scenario Root Cause: {scenario.get('root_cause', '')}\n"
+            f"Debate: ResolutionAgent {'CHALLENGED then reached consensus' if is_challenge else 'agreed immediately'}\n"
+            f"Fix: {fix_data.get('fix', {}).get('description', 'connection release fix')}\n"
+            f"Risk Level: {fix_data.get('fix', {}).get('risk_level', 'LOW')}\n"
+            f"Deployment: {'SUCCESS' if fix_applied else 'FAILED'}\n"
+            f"Health After Fix: {health_status}\n"
+            f"PR URL: {pr_url}\n"
+            f"Total Agent Messages: {len(message_store)}\n"
+                        f"LLM Provider: {LLM_PROVIDER}\n"
+            f"Generate the complete postmortem report."
+        )
+        postmortem_report = await chat_llm(postmortem_system, postmortem_user)
+
+        add_message(
+            sender="PostmortemAgent",
+            recipient="broadcast",
+            msg_type="status",
+            channel="incident.postmortem",
+            incident_id=incident_id,
+            payload={
+                "report_markdown": postmortem_report,
+                "incident_type": scenario["type"],
+                "description": scenario["description"],
+                "total_messages": len(message_store),
+                "debate_rounds": 3 if is_challenge else 1,
+                "resolution_time_seconds": elapsed,
+                "agents_involved": [
+                    "WatcherAgent", "TriageAgent", "DiagnosisAgent",
+                    "ResolutionAgent", "DeployAgent", "PostmortemAgent",
+                ],
+                "status": "POSTMORTEM_COMPLETE",
+            },
+            confidence=0.95,
+        )
+
+        # ═══════════════════════════════════════════════════
+        # PHASE 10: STORE INCIDENT RESULT
+        # ═══════════════════════════════════════════════════
+        incident_store[incident_id] = {
+            "status": "RESOLVED",
+            "incident_id": incident_id,
             "incident_type": scenario["type"],
             "description": scenario["description"],
-            "total_messages": len(message_store),
+            "severity": triage_data.get("severity", "P1"),
+            "classification": triage_data.get("classification", ""),
+            "blast_radius_pct": triage_data.get("blast_radius_pct", 42),
+            "root_cause": diagnosis_data.get("root_cause", {}),
+            "fix": fix_data.get("fix", {}),
+            "debate_occurred": is_challenge,
             "debate_rounds": 3 if is_challenge else 1,
+            "deployment_status": "SUCCESS" if fix_applied else "FAILED",
+            "health_after_fix": health_status,
+            "pr_url": pr_url,
+            "total_messages": len(message_store),
             "resolution_time_seconds": elapsed,
-            "agents_involved": [
-                "WatcherAgent", "TriageAgent", "DiagnosisAgent",
-                "ResolutionAgent", "DeployAgent", "PostmortemAgent",
-            ],
-            "status": "POSTMORTEM_COMPLETE",
-        },
-        confidence=0.95,
-    )
+            "llm_provider": LLM_PROVIDER,
+            "started_at": start_time.isoformat().replace("+00:00", "Z"),
+            "resolved_at": get_iso_now(),
+        }
 
-    # ═══════════════════════════════════════════════════
-    # PHASE 10: STORE INCIDENT RESULT
-    # ═══════════════════════════════════════════════════
-    incident_store[incident_id] = {
-        "status": "RESOLVED",
-        "incident_id": incident_id,
-        "incident_type": scenario["type"],
-        "description": scenario["description"],
-        "severity": triage_data.get("severity", "P1"),
-        "classification": triage_data.get("classification", ""),
-        "blast_radius_pct": triage_data.get("blast_radius_pct", 42),
-        "root_cause": diagnosis_data.get("root_cause", {}),
-        "fix": fix_data.get("fix", {}),
-        "debate_occurred": is_challenge,
-        "debate_rounds": 3 if is_challenge else 1,
-        "deployment_status": "SUCCESS" if fix_applied else "FAILED",
-        "health_after_fix": health_status,
-        "pr_url": pr_url,
-        "total_messages": len(message_store),
-        "resolution_time_seconds": elapsed,
-        "llm_provider": get_llm_provider(),
-        "started_at": start_time.isoformat() + "Z",
-        "resolved_at": datetime.utcnow().isoformat() + "Z",
-    }
+        logger.info(
+            f"✓ Incident {incident_id} RESOLVED in {elapsed:.0f}s | "
+            f"Debate: {'CHALLENGE→DEFEND→CONSENSUS' if is_challenge else 'IMMEDIATE'} | "
+            f"Deploy: {'SUCCESS' if fix_applied else 'FAILED'} | "
+            f"Health: {health_status} | "
+            f"Messages: {len(message_store)}"
+        )
 
-    logger.info(
-        f"✓ Incident {incident_id} RESOLVED in {elapsed:.0f}s | "
-        f"Debate: {'CHALLENGE→DEFEND→CONSENSUS' if is_challenge else 'IMMEDIATE'} | "
-        f"Deploy: {'SUCCESS' if fix_applied else 'FAILED'} | "
-        f"Health: {health_status} | "
-        f"Messages: {len(message_store)}"
-    )
+    except Exception as e:
+        # ═══════════════════════════════════════════════════
+        # PIPELINE ERROR HANDLER
+        # If any phase crashes, log it and broadcast to the dashboard
+        # so the frontend knows something went wrong.
+        # ═══════════════════════════════════════════════════
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+        logger.error(
+            f"❌ Incident pipeline FAILED for {incident_id} "
+            f"after {elapsed:.0f}s: {e}",
+            exc_info=True,
+        )
+        add_message(
+            sender="OrchestratorAgent",
+            recipient="broadcast",
+            msg_type="error",
+            channel="system.error",
+            incident_id=incident_id,
+            payload={
+                "status": "PIPELINE_ERROR",
+                "error": str(e),
+                "elapsed_seconds": elapsed,
+            },
+        )
+        incident_store[incident_id] = {
+            "status": "FAILED",
+            "incident_id": incident_id,
+            "incident_type": scenario["type"],
+            "description": scenario["description"],
+            "error": str(e),
+            "resolution_time_seconds": elapsed,
+            "total_messages": len(message_store),
+            "llm_provider": LLM_PROVIDER,
+            "started_at": start_time.isoformat().replace("+00:00", "Z"),
+            "failed_at": get_iso_now(),
+        }
 
-    incident_running = False
+    finally:
+        # ═══════════════════════════════════════════════════
+        # GUARANTEED CLEANUP
+        # This runs whether the pipeline succeeded or crashed,
+        # ensuring the API is never permanently locked.
+        # ═══════════════════════════════════════════════════
+        incident_running = False
+        logger.info(
+            f"Pipeline finished for {incident_id}. "
+            f"incident_running reset to False."
+        )
 
     return {
         "incident_id": incident_id,
@@ -1459,12 +1524,16 @@ async def run_full_incident(incident_id: str) -> dict:
         "incident_context": incident_context,
         "severity": triage_data.get("severity", "P1"),
         "root_cause": rc_text,
-        "debate": "CHALLENGE + DEFENSE + CONSENSUS" if is_challenge else "IMMEDIATE CONSENSUS",
+        "debate": (
+            "CHALLENGE + DEFENSE + CONSENSUS"
+            if is_challenge
+            else "IMMEDIATE CONSENSUS"
+        ),
         "fix": fix_data.get("fix", {}).get("description", ""),
         "deployment": "SUCCESS" if fix_applied else "FAILED",
         "health": health_status,
         "pr_url": pr_url,
         "resolution_time_seconds": elapsed,
         "total_messages": len(message_store),
-        "llm_provider": get_llm_provider(),
+        "llm_provider": LLM_PROVIDER,
     }

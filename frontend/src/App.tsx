@@ -324,7 +324,6 @@ function App() {
   const [errorHistory, setErrorHistory] = useState<number[]>([0]);
   const [primaryHistory, setPrimaryHistory] = useState<number[]>([0]);
   const [secondaryHistory, setSecondaryHistory] = useState<number[]>([0]);
-  const [tertiaryHistory, setTertiaryHistory] = useState<number[]>([0]);
   const [msgHistory, setMsgHistory] = useState<number[]>([0]);
 
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -443,13 +442,6 @@ function App() {
     return fromAll !== null ? fromAll : 0;
   }, [latestStatus, messages, scenarioMeta]);
 
-  const tertiaryVal = useMemo(() => {
-    const fromStatus = latestStatus ? safeNum(latestStatus[scenarioMeta.metrics.tertiary.key]) : null;
-    if (fromStatus !== null && fromStatus !== 0) return fromStatus;
-    const fromAll = extractMetric(messages, scenarioMeta.metrics.tertiary.key);
-    return fromAll !== null ? fromAll : 0;
-  }, [latestStatus, messages, scenarioMeta]);
-
   // Normalize: if a value <= 1 and unit is %, multiply by 100
   const normalizePct = (val: number, unit: string) => {
     if (unit === "%" && val > 0 && val <= 1) return val * 100;
@@ -458,20 +450,14 @@ function App() {
 
   const primaryDisplay = normalizePct(primaryVal, scenarioMeta.metrics.primary.unit);
   const secondaryDisplay = normalizePct(secondaryVal, scenarioMeta.metrics.secondary.unit);
-  const tertiaryDisplay = normalizePct(tertiaryVal, scenarioMeta.metrics.tertiary.unit);
-
-  // Connection metric fallbacks (for backward compat)
-  const connActive = safeNum(latestStatus?.active_connections, 0);
-  const connMax = safeNum(latestStatus?.max_connections, 20);
 
   // ─── Update metric histories ────────────────────────────
   useEffect(() => {
     setErrorHistory((h) => [...h.slice(-19), errorRate]);
     setPrimaryHistory((h) => [...h.slice(-19), primaryDisplay]);
     setSecondaryHistory((h) => [...h.slice(-19), secondaryDisplay]);
-    setTertiaryHistory((h) => [...h.slice(-19), tertiaryDisplay]);
     setMsgHistory((h) => [...h.slice(-19), incidentMessages.length]);
-  }, [errorRate, primaryDisplay, secondaryDisplay, tertiaryDisplay, incidentMessages.length]);
+  }, [errorRate, primaryDisplay, secondaryDisplay, incidentMessages.length]);
 
   // ─── Triggers & Auto-Switches ───────────────────────────
   useEffect(() => {
@@ -514,7 +500,6 @@ function App() {
       setErrorHistory([0]);
       setPrimaryHistory([0]);
       setSecondaryHistory([0]);
-      setTertiaryHistory([0]);
       setMsgHistory([0]);
 
       // Pre-set the type if user picked one
@@ -566,7 +551,6 @@ function App() {
     setErrorHistory([0]);
     setPrimaryHistory([0]);
     setSecondaryHistory([0]);
-    setTertiaryHistory([0]);
     setMsgHistory([0]);
 
     fetch(BACKEND_URL + "/reset", { method: "POST" }).catch(() => {});

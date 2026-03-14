@@ -37,6 +37,8 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-06")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TARGET_APP_URL = os.getenv(
     "TARGET_APP_URL",
@@ -122,64 +124,135 @@ def get_llm_provider() -> str:
     """Detect which LLM provider is available"""
     if AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT:
         return "azure_openai"
-    if OPENAI_API_KEY:
+    elif OPENROUTER_API_KEY:
+        return "openrouter"
+    elif OPENAI_API_KEY:
         return "openai"
-    return "mock"
+    else:
+        return "mock"
+
+
+LLM_PROVIDER = get_llm_provider()
+logger.info(f"LLM Provider: {LLM_PROVIDER}")
 
 
 # ═══════════════════════════════════════════════════════════
-# LLM SERVICE — Azure OpenAI → OpenAI → Mock Fallback
+# LLM SERVICE — Azure OpenAI → OpenRouter → OpenAI → Mock Fallback
 # ═══════════════════════════════════════════════════════════
+
+async def _call_azure_openai(system_prompt: str, user_prompt: str) -> str:
+    try:
+        from openai import AsyncAzureOpenAI
+
+        client = AsyncAzureOpenAI(
+            api_key=AZURE_OPENAI_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        )
+        response = await client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("Azure OpenAI response content is empty")
+        logger.info("[LLM] Azure OpenAI response received")
+        return content
+    except Exception as e:
+        logger.error(f"[LLM] Azure OpenAI error: {e}")
+        return mock_response(system_prompt)
+
+async def _call_openrouter(system_prompt: str, user_prompt: str) -> str:
+    try:
+        import httpx
+
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 2000,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=45) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("OpenRouter response missing choices")
+
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            raise ValueError("OpenRouter response missing message")
+
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("OpenRouter response content is empty or invalid")
+
+        logger.info("[LLM] OpenRouter response received")
+        return content
+    except Exception as e:
+        logger.error(f"[LLM] OpenRouter error: {e}")
+        return mock_response(system_prompt)
+
+
+async def _call_openai(system_prompt: str, user_prompt: str) -> str:
+    try:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("OpenAI response content is empty")
+        logger.info("[LLM] OpenAI response received")
+        return content
+    except Exception as e:
+        logger.error(f"[LLM] OpenAI error: {e}")
+        return mock_response(system_prompt)
+
 
 async def chat_llm(system_prompt: str, user_prompt: str) -> str:
+    global LLM_PROVIDER
     provider = get_llm_provider()
+    LLM_PROVIDER = provider
+    logger.info(f"LLM Provider: {LLM_PROVIDER}")
 
-    # ── Azure OpenAI ────────────────────────────────────
     if provider == "azure_openai":
-        try:
-            from openai import AsyncAzureOpenAI
+        return await _call_azure_openai(system_prompt, user_prompt)
 
-            client = AsyncAzureOpenAI(
-                api_key=AZURE_OPENAI_KEY,
-                api_version=AZURE_OPENAI_API_VERSION,
-                azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            )
-            response = await client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=2000,
-            )
-            logger.info("[LLM] Azure OpenAI response received")
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.error(f"[LLM] Azure OpenAI error: {e}")
-            # Fall through to OpenAI or mock
+    if provider == "openrouter":
+        return await _call_openrouter(system_prompt, user_prompt)
 
-    # ── OpenAI (fallback) ───────────────────────────────
-    if provider == "openai" or (provider == "azure_openai" and OPENAI_API_KEY):
-        try:
-            from openai import AsyncOpenAI
+    if provider == "openai":
+        return await _call_openai(system_prompt, user_prompt)
 
-            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=2000,
-            )
-            logger.info("[LLM] OpenAI response received")
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.error(f"[LLM] OpenAI error: {e}")
-
-    # ── Mock Fallback ───────────────────────────────────
     logger.info("[LLM] Using mock response (no API keys configured)")
     return mock_response(system_prompt)
 
@@ -510,7 +583,8 @@ def api_health(req: func.HttpRequest) -> func.HttpResponse:
         "version": "1.0.0",
         "status": "running",
         "platform": "Azure Functions (Serverless)",
-        "llm_provider": get_llm_provider(),
+        "llm_provider": LLM_PROVIDER,
+        "llm_model": OPENROUTER_MODEL,
         "target_app_url": TARGET_APP_URL,
         "total_messages": len(message_store),
         "active_incidents": len(incident_store),

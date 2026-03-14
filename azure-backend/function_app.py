@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import base64
+import random
 from datetime import datetime
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -54,6 +55,59 @@ CORS_HEADERS = {
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
     "Access-Control-Max-Age": "86400",
 }
+
+INCIDENT_SCENARIOS = [
+    {
+        "type": "connection_pool_exhaustion",
+        "severity": "P1",
+        "description": "Database connection pool leak causing request failures",
+        "symptoms": {
+            "error_rate": 0.42,
+            "latency_ms": 8000,
+            "connections": "100/100"
+        }
+    },
+    {
+        "type": "memory_leak",
+        "severity": "P1",
+        "description": "Memory usage increasing due to unbounded cache growth",
+        "symptoms": {
+            "memory_usage": "92%",
+            "latency_ms": 4000,
+            "error_rate": 0.18
+        }
+    },
+    {
+        "type": "slow_database_queries",
+        "severity": "P2",
+        "description": "Database queries slowing due to missing index",
+        "symptoms": {
+            "latency_ms": 6000,
+            "error_rate": 0.05,
+            "query_time": "5s"
+        }
+    },
+    {
+        "type": "external_api_failure",
+        "severity": "P1",
+        "description": "Third-party payment API returning 503 errors",
+        "symptoms": {
+            "error_rate": 0.37,
+            "api_status": "503",
+            "latency_ms": 7000
+        }
+    },
+    {
+        "type": "cache_failure",
+        "severity": "P2",
+        "description": "Redis cache unavailable causing heavy DB load",
+        "symptoms": {
+            "cache_status": "down",
+            "latency_ms": 5000,
+            "db_load": "high"
+        }
+    }
+]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -165,7 +219,7 @@ async def _call_azure_openai(system_prompt: str, user_prompt: str) -> str:
         return content
     except Exception as e:
         logger.error(f"[LLM] Azure OpenAI error: {e}")
-        return mock_response(system_prompt)
+        return mock_response(system_prompt, user_prompt)
 
 async def _call_openrouter(system_prompt: str, user_prompt: str) -> str:
     try:
@@ -211,7 +265,7 @@ async def _call_openrouter(system_prompt: str, user_prompt: str) -> str:
         return content
     except Exception as e:
         logger.error(f"[LLM] OpenRouter error: {e}")
-        return mock_response(system_prompt)
+        return mock_response(system_prompt, user_prompt)
 
 
 async def _call_openai(system_prompt: str, user_prompt: str) -> str:
@@ -235,7 +289,7 @@ async def _call_openai(system_prompt: str, user_prompt: str) -> str:
         return content
     except Exception as e:
         logger.error(f"[LLM] OpenAI error: {e}")
-        return mock_response(system_prompt)
+        return mock_response(system_prompt, user_prompt)
 
 
 async def chat_llm(system_prompt: str, user_prompt: str) -> str:
@@ -254,11 +308,12 @@ async def chat_llm(system_prompt: str, user_prompt: str) -> str:
         return await _call_openai(system_prompt, user_prompt)
 
     logger.info("[LLM] Using mock response (no API keys configured)")
-    return mock_response(system_prompt)
+    return mock_response(system_prompt, user_prompt)
 
 
-def mock_response(system_prompt: str) -> str:
+def mock_response(system_prompt: str, user_prompt: str = "") -> str:
     sp = system_prompt.lower()
+    up = user_prompt.lower()
 
     if "triage" in sp:
         return json.dumps({
@@ -276,26 +331,50 @@ def mock_response(system_prompt: str) -> str:
         })
 
     elif "diagnos" in sp and "challenge" not in sp and "defend" not in sp:
+        scenario_type = "connection_pool_exhaustion"
+        if "type:" in up:
+            for line in up.splitlines():
+                if line.strip().startswith("type:"):
+                    scenario_type = line.split(":", 1)[1].strip()
+                    break
+
+        if scenario_type == "memory_leak":
+            root_cause_detail = "Unbounded cache storing objects without eviction policy"
+            category = "MEMORY_LEAK"
+            component = "application_cache"
+        elif scenario_type == "slow_database_queries":
+            root_cause_detail = "Missing database index causing full table scans"
+            category = "QUERY_PERFORMANCE"
+            component = "database_indexes"
+        elif scenario_type == "external_api_failure":
+            root_cause_detail = "Upstream payment API returning intermittent 503 errors"
+            category = "UPSTREAM_DEPENDENCY"
+            component = "payment_provider_api"
+        elif scenario_type == "cache_failure":
+            root_cause_detail = "Redis cache node unavailable forcing database reads"
+            category = "CACHE_OUTAGE"
+            component = "redis_cache"
+        else:
+            root_cause_detail = "Database connection pool exhaustion due to leaked connections"
+            category = "RESOURCE_EXHAUSTION"
+            component = "database_connection_pool"
+
         return json.dumps({
             "root_cause": {
-                "category": "RESOURCE_EXHAUSTION",
-                "component": "database_connection_pool",
+                "category": category,
+                "component": component,
                 "file": "app.py",
                 "function": "list_tasks / create_task",
                 "mechanism": (
-                    "Database connections are not being released in the "
-                    "finally block when errors occur. The conditional logic "
-                    "in the finally block skips pool.release() 70% of the "
-                    "time when BUG_INJECTED is True, causing connection "
-                    "pool exhaustion."
+                    root_cause_detail
                 ),
-                "detail": "Connection pool leak in error handling path",
+                "detail": root_cause_detail,
             },
             "confidence": 0.88,
             "evidence_analysis": [
-                "Connection utilization at 90%+ indicates pool exhaustion",
-                "Error rate spike correlates with rising connection count",
-                "Pattern matches known connection leak anti-pattern",
+                f"Scenario type detected: {scenario_type}",
+                "Symptoms correlate with observed production degradation",
+                "Pattern matches known failure mode for this incident type",
             ],
             "alternative_hypotheses": [
                 {
@@ -758,6 +837,8 @@ async def run_full_incident(incident_id: str) -> dict:
 
     target = TARGET_APP_URL
     start_time = datetime.utcnow()
+    scenario = random.choice(INCIDENT_SCENARIOS)
+    incident_type = scenario["type"]
 
     # ═══════════════════════════════════════════════════
     # PHASE 1: ORCHESTRATOR — Start Lifecycle
@@ -776,8 +857,26 @@ async def run_full_incident(incident_id: str) -> dict:
                 "WatcherAgent", "TriageAgent", "DiagnosisAgent",
                 "ResolutionAgent", "DeployAgent", "PostmortemAgent",
             ],
+            "incident_type": incident_type,
+            "scenario_description": scenario["description"],
         },
     )
+
+    add_message(
+        sender="WatcherAgent",
+        recipient="Dashboard",
+        msg_type="status",
+        channel="incident.detection",
+        incident_id=incident_id,
+        payload={
+            "agent": "WatcherAgent",
+            "stage": "DETECT",
+            "message": f"Anomaly detected: {scenario['description']}",
+            "metrics": scenario["symptoms"],
+            "incident_type": incident_type,
+        },
+    )
+
     send_stage("DETECT", incident_id)
     await asyncio.sleep(1)
 
@@ -946,6 +1045,11 @@ async def run_full_incident(incident_id: str) -> dict:
         "\"evidence_analysis\": [strings], \"alternative_hypotheses\": [objects]}"
     )
     diagnosis_user = (
+        f"Incident scenario detected.\n\n"
+        f"Type: {scenario['type']}\n"
+        f"Description: {scenario['description']}\n"
+        f"Symptoms: {scenario['symptoms']}\n\n"
+        f"Analyze the root cause and propose a fix.\n\n"
         f"Incident data:\n"
         f"- Severity: {triage_data.get('severity', 'P1')}\n"
         f"- Error rate: {error_rate*100:.1f}%\n"
@@ -1194,6 +1298,8 @@ async def run_full_incident(incident_id: str) -> dict:
     )
     postmortem_user = (
         f"Incident: {incident_id}\n"
+        f"Incident Type: {scenario['type']}\n"
+        f"Scenario Description: {scenario['description']}\n"
         f"Duration: {elapsed:.0f} seconds\n"
         f"Severity: {triage_data.get('severity', 'P1')}\n"
         f"Classification: {triage_data.get('classification', 'SERVICE_DEGRADATION')}\n"
@@ -1219,6 +1325,8 @@ async def run_full_incident(incident_id: str) -> dict:
         incident_id=incident_id,
         payload={
             "report_markdown": postmortem_report,
+            "incident_type": scenario["type"],
+            "description": scenario["description"],
             "total_messages": len(message_store),
             "debate_rounds": 3 if is_challenge else 1,
             "resolution_time_seconds": elapsed,
@@ -1237,6 +1345,8 @@ async def run_full_incident(incident_id: str) -> dict:
     incident_store[incident_id] = {
         "status": "RESOLVED",
         "incident_id": incident_id,
+        "incident_type": scenario["type"],
+        "description": scenario["description"],
         "severity": triage_data.get("severity", "P1"),
         "classification": triage_data.get("classification", ""),
         "blast_radius_pct": triage_data.get("blast_radius_pct", 42),
@@ -1266,6 +1376,7 @@ async def run_full_incident(incident_id: str) -> dict:
 
     return {
         "incident_id": incident_id,
+        "incident_type": scenario["type"],
         "severity": triage_data.get("severity", "P1"),
         "root_cause": rc_text,
         "debate": "CHALLENGE + DEFENSE + CONSENSUS" if is_challenge else "IMMEDIATE CONSENSUS",

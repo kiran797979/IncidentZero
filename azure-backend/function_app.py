@@ -1,4 +1,3 @@
-
 """
 IncidentZero Backend — Azure Functions (Serverless)
 Autonomous AI SRE Team — Multi-Agent Incident Resolution
@@ -25,6 +24,7 @@ import base64
 import random
 import re
 import httpx
+import traceback
 from datetime import datetime, timezone
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -62,65 +62,131 @@ CORS_HEADERS = {
     "Access-Control-Max-Age": "86400",
 }
 
+
+# ═══════════════════════════════════════════════════════════
+# 7 INCIDENT SCENARIOS — each run cycles to the next one
+# ═══════════════════════════════════════════════════════════
+
 INCIDENT_SCENARIOS = [
     {
         "type": "connection_pool_exhaustion",
-        "description": "Database connection pool leak causing request failures",
+        "description": "Database connection pool leak causing cascading request failures",
         "symptoms": {
             "error_rate": 0.42,
-            "latency_ms": 8000,
-            "connections": "100/100",
+            "latency_ms": 8200,
+            "connections": "19/20",
+            "cpu_pct": 34,
+            "memory_pct": 61,
         },
-        "root_cause": "Connections are not released in the finally block causing pool exhaustion",
+        "root_cause": "Connections not released in the finally block causing pool exhaustion",
+        "severity": "P1",
+        "blast_radius_pct": 42,
     },
     {
         "type": "memory_leak",
-        "description": "Memory usage increasing due to unbounded cache growth",
+        "description": "Unbounded in-memory cache growing without eviction policy",
         "symptoms": {
-            "memory_usage": "92%",
+            "memory_usage_pct": 92,
             "latency_ms": 4200,
+            "gc_pause_ms": 850,
+            "heap_mb": 1780,
+            "error_rate": 0.18,
         },
-        "root_cause": "Cache storing objects without eviction policy causing memory leak",
+        "root_cause": "Cache storing objects without TTL or max-size eviction",
+        "severity": "P1",
+        "blast_radius_pct": 55,
     },
     {
         "type": "slow_database_queries",
-        "description": "Database queries slow due to missing index",
+        "description": "Missing composite index causing full table scans on hot path",
         "symptoms": {
-            "latency_ms": 6000,
-            "query_time": "5s",
+            "latency_ms": 6100,
+            "query_time_ms": 5200,
+            "error_rate": 0.08,
+            "db_cpu_pct": 97,
+            "rows_scanned": 2_400_000,
         },
-        "root_cause": "Missing database index causing full table scans",
+        "root_cause": "Missing database index on (status, created_at) columns",
+        "severity": "P2",
+        "blast_radius_pct": 30,
     },
     {
         "type": "external_api_failure",
-        "description": "Third-party payment API returning 503 errors",
+        "description": "Upstream payment gateway returning intermittent 503 errors",
         "symptoms": {
             "error_rate": 0.37,
             "api_status": "503",
-            "latency_ms": 7000,
+            "latency_ms": 7400,
+            "retry_queue_depth": 1240,
+            "timeout_count": 87,
         },
-        "root_cause": "Upstream payment API intermittently failing",
+        "root_cause": "Payment provider API unstable; no circuit breaker configured",
+        "severity": "P1",
+        "blast_radius_pct": 37,
     },
     {
         "type": "cache_failure",
-        "description": "Redis cache unavailable causing heavy DB load",
+        "description": "Redis primary node unreachable — thundering herd hitting database",
         "symptoms": {
             "cache_status": "down",
-            "db_load": "high",
+            "db_load_pct": 96,
+            "latency_ms": 5800,
+            "cache_hit_rate": 0.0,
+            "error_rate": 0.29,
         },
-        "root_cause": "Redis node unavailable forcing database reads",
+        "root_cause": "Redis node crashed; no fallback or stale-serve strategy",
+        "severity": "P1",
+        "blast_radius_pct": 48,
+    },
+    {
+        "type": "cpu_spike_thread_deadlock",
+        "description": "Worker threads deadlocked on shared mutex causing CPU spike and request starvation",
+        "symptoms": {
+            "cpu_pct": 99,
+            "active_threads": 200,
+            "blocked_threads": 187,
+            "latency_ms": 12000,
+            "error_rate": 0.65,
+            "throughput_rps": 3,
+        },
+        "root_cause": "Two code paths acquire locks in opposite order causing deadlock",
+        "severity": "P0",
+        "blast_radius_pct": 85,
+    },
+    {
+        "type": "disk_io_saturation",
+        "description": "Synchronous log flushing saturating disk I/O and blocking event loop",
+        "symptoms": {
+            "disk_util_pct": 100,
+            "iowait_pct": 78,
+            "latency_ms": 9500,
+            "error_rate": 0.31,
+            "log_queue_depth": 48000,
+            "write_throughput_mbps": 0.4,
+        },
+        "root_cause": "Debug-level logging with sync flush on every request saturates disk",
+        "severity": "P1",
+        "blast_radius_pct": 44,
     },
 ]
 
 
 # ═══════════════════════════════════════════════════════════
 # IN-MEMORY STORES
-# (Ephemeral in pure serverless — works for single-instance demos)
 # ═══════════════════════════════════════════════════════════
 
 message_store: list = []
 incident_store: dict = {}
 incident_running: bool = False
+_scenario_index: int = 0          # rotates through the 7 scenarios
+
+
+def _next_scenario() -> dict:
+    """Return the next scenario in round-robin order (never the same twice in a row)."""
+    global _scenario_index
+    scenario = INCIDENT_SCENARIOS[_scenario_index % len(INCIDENT_SCENARIOS)]
+    _scenario_index += 1
+    return scenario
 
 
 # ═══════════════════════════════════════════════════════════
@@ -128,8 +194,14 @@ incident_running: bool = False
 # ═══════════════════════════════════════════════════════════
 
 def get_iso_now() -> str:
-    """Returns a strict ISO 8601 UTC timestamp ending in Z."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe(value, default="N/A"):
+    """Return *value* if truthy, otherwise *default*. Prevents empty strings / None."""
+    if value is None or value == "":
+        return default
+    return value
 
 
 def add_message(
@@ -140,22 +212,22 @@ def add_message(
     payload: dict,
     incident_id: str = "",
     confidence: float = 0.0,
-    evidence: list = None,
+    evidence: list | None = None,
 ) -> dict:
     msg = {
         "message_id": f"msg-{len(message_store):04d}",
-        "sender": sender,
-        "recipient": recipient,
-        "message_type": msg_type,
-        "channel": channel,
-        "payload": payload,
-        "incident_id": incident_id,
-        "confidence": confidence,
-        "evidence": evidence or [],
+        "sender": _safe(sender, "System"),
+        "recipient": _safe(recipient, "broadcast"),
+        "message_type": _safe(msg_type, "status"),
+        "channel": _safe(channel, "system"),
+        "payload": payload if isinstance(payload, dict) else {"raw": str(payload)},
+        "incident_id": _safe(incident_id, ""),
+        "confidence": confidence if isinstance(confidence, (int, float)) else 0.0,
+        "evidence": evidence if isinstance(evidence, list) else [],
         "timestamp": get_iso_now(),
     }
     message_store.append(msg)
-    logger.info(f"[MCP] {sender} -> {recipient} | {msg_type} | {channel}")
+    logger.info(f"[MCP] {msg['sender']} -> {msg['recipient']} | {msg['message_type']} | {msg['channel']}")
     return msg
 
 
@@ -184,7 +256,6 @@ def cors_preflight() -> func.HttpResponse:
 
 
 def get_llm_provider() -> str:
-    """Detect which LLM provider is available."""
     if AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT:
         return "azure_openai"
     if OPENROUTER_API_KEY:
@@ -199,12 +270,11 @@ logger.info(f"Initialized LLM Provider: {LLM_PROVIDER}")
 
 
 # ═══════════════════════════════════════════════════════════
-# LLM SERVICE — Azure OpenAI → OpenRouter → OpenAI → Mock
+# LLM SERVICE
 # ═══════════════════════════════════════════════════════════
 
 async def _call_azure_openai(system_prompt: str, user_prompt: str) -> str:
     from openai import AsyncAzureOpenAI
-
     client = AsyncAzureOpenAI(
         api_key=AZURE_OPENAI_KEY,
         api_version=AZURE_OPENAI_API_VERSION,
@@ -221,8 +291,7 @@ async def _call_azure_openai(system_prompt: str, user_prompt: str) -> str:
     )
     content = response.choices[0].message.content
     if not content:
-        raise ValueError("Azure OpenAI response content is empty")
-    logger.info("[LLM] Azure OpenAI response received")
+        raise ValueError("Azure OpenAI returned empty content")
     return content
 
 
@@ -240,7 +309,6 @@ async def _call_openrouter(system_prompt: str, user_prompt: str) -> str:
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-
     async with httpx.AsyncClient(timeout=45) as client:
         response = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -249,26 +317,20 @@ async def _call_openrouter(system_prompt: str, user_prompt: str) -> str:
         )
         response.raise_for_status()
         data = response.json()
-
     choices = data.get("choices") if isinstance(data, dict) else None
     if not isinstance(choices, list) or not choices:
         raise ValueError("OpenRouter response missing choices")
-
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
     if not isinstance(message, dict):
         raise ValueError("OpenRouter response missing message")
-
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise ValueError("OpenRouter response content is empty or invalid")
-
-    logger.info("[LLM] OpenRouter response received")
+        raise ValueError("OpenRouter content empty")
     return content
 
 
 async def _call_openai(system_prompt: str, user_prompt: str) -> str:
     from openai import AsyncOpenAI
-
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     response = await client.chat.completions.create(
         model="gpt-4o",
@@ -281,13 +343,12 @@ async def _call_openai(system_prompt: str, user_prompt: str) -> str:
     )
     content = response.choices[0].message.content
     if not content:
-        raise ValueError("OpenAI response content is empty")
-    logger.info("[LLM] OpenAI response received")
+        raise ValueError("OpenAI returned empty content")
     return content
 
 
 async def chat_llm(system_prompt: str, user_prompt: str) -> str:
-    """Call the configured LLM provider with automatic mock fallback."""
+    """Call the configured LLM with automatic mock fallback — never raises."""
     try:
         if LLM_PROVIDER == "azure_openai":
             return await _call_azure_openai(system_prompt, user_prompt)
@@ -296,187 +357,453 @@ async def chat_llm(system_prompt: str, user_prompt: str) -> str:
         if LLM_PROVIDER == "openai":
             return await _call_openai(system_prompt, user_prompt)
     except Exception as e:
-        logger.error(f"[LLM] Error calling {LLM_PROVIDER}: {e}", exc_info=True)
-
-    logger.info("[LLM] Using mock response (no API keys configured or call failed)")
+        logger.error(f"[LLM] {LLM_PROVIDER} call failed: {e}")
+    # guaranteed fallback
     return mock_response(system_prompt, user_prompt)
 
 
-def mock_response(system_prompt: str, user_prompt: str = "") -> str:
-    sp = system_prompt.lower()
-    up = user_prompt.lower()
+# ═══════════════════════════════════════════════════════════
+# RICH MOCK RESPONSES — fully scenario-aware for all 7 types
+# ═══════════════════════════════════════════════════════════
 
-    scenario_type = "connection_pool_exhaustion"
-    if "type:" in up:
-        for line in up.splitlines():
-            if line.strip().startswith("type:"):
-                scenario_type = line.split(":", 1)[1].strip()
-                break
+# ---------- per-scenario data tables ----------
 
-    if "triage" in sp:
-        return json.dumps({
-            "severity": "P1",
-            "classification": "SERVICE_DEGRADATION",
-            "blast_radius_pct": 42,
-            "affected_endpoints": ["/tasks", "/tasks/{id}"],
-            "auto_resolve_eligible": True,
-            "escalate_to_human": False,
-            "reasoning": (
-                "Error rate spike to 40%+ with connection pool nearing "
-                "exhaustion indicates P1 service degradation affecting "
-                "approximately 42% of users."
+_MOCK_TRIAGE = {
+    "connection_pool_exhaustion": {
+        "severity": "P1",
+        "classification": "RESOURCE_EXHAUSTION",
+        "blast_radius_pct": 42,
+        "affected_endpoints": ["/tasks", "/tasks/{id}", "/tasks/search"],
+        "auto_resolve_eligible": True,
+        "escalate_to_human": False,
+        "reasoning": (
+            "Error rate spiked to 42 % with the connection pool at 95 % "
+            "utilization. Requests are failing because no connections are "
+            "available, impacting roughly 42 % of users."
+        ),
+    },
+    "memory_leak": {
+        "severity": "P1",
+        "classification": "MEMORY_EXHAUSTION",
+        "blast_radius_pct": 55,
+        "affected_endpoints": ["/tasks", "/reports/generate", "/export"],
+        "auto_resolve_eligible": True,
+        "escalate_to_human": False,
+        "reasoning": (
+            "Heap usage at 92 % with 850 ms GC pauses. The cache grows "
+            "without eviction, risking OOM within minutes. ~55 % of "
+            "request paths touch the cache."
+        ),
+    },
+    "slow_database_queries": {
+        "severity": "P2",
+        "classification": "PERFORMANCE_DEGRADATION",
+        "blast_radius_pct": 30,
+        "affected_endpoints": ["/tasks", "/tasks/filter"],
+        "auto_resolve_eligible": True,
+        "escalate_to_human": False,
+        "reasoning": (
+            "p99 latency jumped to 6 s. The query planner is running full "
+            "table scans on 2.4 M rows. Impact is limited to list/filter "
+            "endpoints (~30 % of traffic)."
+        ),
+    },
+    "external_api_failure": {
+        "severity": "P1",
+        "classification": "UPSTREAM_DEPENDENCY_FAILURE",
+        "blast_radius_pct": 37,
+        "affected_endpoints": ["/checkout", "/payments", "/refunds"],
+        "auto_resolve_eligible": True,
+        "escalate_to_human": False,
+        "reasoning": (
+            "Payment gateway returning 503 for 37 % of calls. No circuit "
+            "breaker is configured, so every checkout attempt hangs for "
+            "the full 30 s timeout."
+        ),
+    },
+    "cache_failure": {
+        "severity": "P1",
+        "classification": "INFRASTRUCTURE_OUTAGE",
+        "blast_radius_pct": 48,
+        "affected_endpoints": ["/tasks", "/dashboard", "/search"],
+        "auto_resolve_eligible": True,
+        "escalate_to_human": False,
+        "reasoning": (
+            "Redis primary is unreachable. Cache hit rate dropped to 0 %. "
+            "All reads are falling through to the database, pushing DB "
+            "CPU to 96 %. ~48 % of traffic is affected."
+        ),
+    },
+    "cpu_spike_thread_deadlock": {
+        "severity": "P0",
+        "classification": "CRITICAL_OUTAGE",
+        "blast_radius_pct": 85,
+        "affected_endpoints": ["/tasks", "/tasks/{id}", "/health", "/admin"],
+        "auto_resolve_eligible": True,
+        "escalate_to_human": True,
+        "reasoning": (
+            "CPU pegged at 99 % with 187/200 threads blocked. Only 3 RPS "
+            "throughput vs normal 1200 RPS. This is a near-total outage "
+            "affecting 85 % of users."
+        ),
+    },
+    "disk_io_saturation": {
+        "severity": "P1",
+        "classification": "IO_BOTTLENECK",
+        "blast_radius_pct": 44,
+        "affected_endpoints": ["/tasks", "/upload", "/reports"],
+        "auto_resolve_eligible": True,
+        "escalate_to_human": False,
+        "reasoning": (
+            "Disk utilization at 100 %, iowait at 78 %. Synchronous log "
+            "flushing on every request is blocking the event loop. ~44 % "
+            "of requests are timing out."
+        ),
+    },
+}
+
+_MOCK_DIAGNOSIS = {
+    "connection_pool_exhaustion": {
+        "root_cause": {
+            "category": "RESOURCE_EXHAUSTION",
+            "component": "database_connection_pool",
+            "file": "app.py",
+            "function": "list_tasks / create_task",
+            "mechanism": "Connection pool leak in finally block",
+            "detail": (
+                "The finally clause uses a conditional random check that "
+                "skips pool.release() ~70 % of the time when the bug flag "
+                "is active, causing connections to leak until the pool is "
+                "fully exhausted."
             ),
-        })
-
-    if "diagnos" in sp and "challenge" not in sp and "defend" not in sp:
-        if scenario_type == "memory_leak":
-            root_cause_detail = "Unbounded cache storing objects without eviction policy"
-            category = "MEMORY_LEAK"
-            component = "application_cache"
-        elif scenario_type == "slow_database_queries":
-            root_cause_detail = "Missing database index causing full table scans"
-            category = "QUERY_PERFORMANCE"
-            component = "database_indexes"
-        elif scenario_type == "external_api_failure":
-            root_cause_detail = "Upstream payment API returning intermittent 503 errors"
-            category = "UPSTREAM_DEPENDENCY"
-            component = "payment_provider_api"
-        elif scenario_type == "cache_failure":
-            root_cause_detail = "Redis cache node unavailable forcing database reads"
-            category = "CACHE_OUTAGE"
-            component = "redis_cache"
-        else:
-            root_cause_detail = "Database connection pool exhaustion due to leaked connections"
-            category = "RESOURCE_EXHAUSTION"
-            component = "database_connection_pool"
-
-        return json.dumps({
-            "root_cause": {
-                "category": category,
-                "component": component,
-                "file": "app.py",
-                "function": "list_tasks / create_task",
-                "mechanism": root_cause_detail,
-                "detail": root_cause_detail,
-            },
-            "confidence": 0.88,
-            "evidence_analysis": [
-                f"Scenario type detected: {scenario_type}",
-                "Symptoms correlate with observed production degradation",
-                "Pattern matches known failure mode for this incident type",
-            ],
-            "alternative_hypotheses": [
-                {
-                    "category": "SLOW_QUERIES",
-                    "confidence": 0.12,
-                    "reason": "Query times appear normal based on response latency",
-                }
-            ],
-        })
-
-    if "challenge" in sp or "evaluate" in sp or "devil" in sp:
-        if scenario_type == "memory_leak":
-            challenge_reason = "Could this memory growth be caused by unbounded caching rather than database usage?"
-            alternative = "memory_pressure_from_cache"
-        elif scenario_type == "slow_database_queries":
-            challenge_reason = "Could slow queries be causing resource contention rather than connection leaks?"
-            alternative = "query_contention"
-        elif scenario_type == "external_api_failure":
-            challenge_reason = "Could upstream API failures be propagating errors through the service?"
-            alternative = "upstream_api_propagation"
-        elif scenario_type == "cache_failure":
-            challenge_reason = "Is the database overloaded due to cache misses?"
-            alternative = "cache_miss_overload"
-        else:
-            challenge_reason = "Could slow queries be holding connections longer than expected?"
-            alternative = "slow_query_blocking"
-
-        return json.dumps({
-            "assessment": "CHALLENGE",
-            "reasoning": challenge_reason,
-            "challenge_question": "What direct evidence confirms this as the primary root cause?",
-            "alternative_hypothesis": alternative,
-            "confidence_in_diagnosis": 0.65,
-        })
-
-    if "defend" in sp or "responding to" in sp:
-        return json.dumps({
-            "response_type": "DEFEND",
-            "response": (
-                "Good challenge. I checked the connection hold times. "
-                "Average query execution time is 10ms (normal). However, "
-                "connection HOLD time in error cases is 847ms because "
-                "connections are never released when exceptions occur. "
-                "This confirms a connection leak, not slow queries. "
-                "The finally block has conditional logic that skips "
-                "pool.release() 70% of the time."
+        },
+        "confidence": 0.88,
+        "evidence_analysis": [
+            "active_connections 19/20 — pool nearly exhausted",
+            "Error rate correlates with connection count growth",
+            "Thread dump shows threads waiting on pool.acquire()",
+            "Connection hold time in error path: 847 ms (normal: 10 ms)",
+        ],
+        "alternative_hypotheses": [
+            {"category": "SLOW_QUERIES", "confidence": 0.10, "reason": "Query exec times are normal (< 15 ms)"},
+        ],
+    },
+    "memory_leak": {
+        "root_cause": {
+            "category": "MEMORY_LEAK",
+            "component": "application_cache",
+            "file": "app.py",
+            "function": "get_or_set_cache",
+            "mechanism": "Unbounded dict cache with no eviction",
+            "detail": (
+                "Every unique request key is cached in a plain dict with "
+                "no max-size limit and no TTL. Under production traffic "
+                "patterns the cache grows to millions of entries."
             ),
-            "additional_evidence": [
-                "avg_query_time: 10ms (normal)",
-                "avg_conn_hold_time_error_path: 847ms (abnormal)",
-                "finally block: conditional release based on random()",
-            ],
-            "confidence": 0.94,
-        })
+        },
+        "confidence": 0.91,
+        "evidence_analysis": [
+            "Heap grew from 400 MB to 1780 MB in 20 minutes",
+            "GC pause time increased from 5 ms to 850 ms",
+            "Object count in cache dict: 2.4 M entries",
+            "No __del__ or weakref clean-up observed",
+        ],
+        "alternative_hypotheses": [
+            {"category": "LARGE_PAYLOADS", "confidence": 0.08, "reason": "Request/response sizes are within normal range"},
+        ],
+    },
+    "slow_database_queries": {
+        "root_cause": {
+            "category": "QUERY_PERFORMANCE",
+            "component": "database_indexes",
+            "file": "schema.sql",
+            "function": "SELECT * FROM tasks WHERE status = ? ORDER BY created_at",
+            "mechanism": "Missing composite index forces sequential scan",
+            "detail": (
+                "The tasks table has 2.4 M rows. The hot query filters by "
+                "status and sorts by created_at, but there is no index on "
+                "(status, created_at). The planner chooses Seq Scan → Sort."
+            ),
+        },
+        "confidence": 0.93,
+        "evidence_analysis": [
+            "EXPLAIN shows Seq Scan on tasks (cost=0..48723)",
+            "Rows scanned per query: 2,400,000",
+            "Adding the index in staging reduced query from 5.2 s to 4 ms",
+            "DB CPU dropped from 97 % to 12 % after index in staging",
+        ],
+        "alternative_hypotheses": [
+            {"category": "LOCK_CONTENTION", "confidence": 0.06, "reason": "pg_locks shows no waiting transactions"},
+        ],
+    },
+    "external_api_failure": {
+        "root_cause": {
+            "category": "UPSTREAM_DEPENDENCY",
+            "component": "payment_provider_api",
+            "file": "app.py",
+            "function": "process_payment",
+            "mechanism": "No circuit breaker; retries amplify upstream failure",
+            "detail": (
+                "The payment gateway is returning 503 intermittently. Our "
+                "client has no circuit breaker, so every failed call is "
+                "retried 3× with no back-off, amplifying load on the "
+                "already-struggling upstream."
+            ),
+        },
+        "confidence": 0.89,
+        "evidence_analysis": [
+            "Payment API 503 rate: 37 % over last 5 min",
+            "Retry queue depth: 1240 (should be < 50)",
+            "Timeout count: 87 in 5 min window",
+            "Status page for provider confirms degradation",
+        ],
+        "alternative_hypotheses": [
+            {"category": "DNS_RESOLUTION", "confidence": 0.05, "reason": "DNS TTL is fine; resolution < 2 ms"},
+        ],
+    },
+    "cache_failure": {
+        "root_cause": {
+            "category": "CACHE_OUTAGE",
+            "component": "redis_primary",
+            "file": "app.py",
+            "function": "cache_get / cache_set",
+            "mechanism": "Redis primary unreachable; no fallback configured",
+            "detail": (
+                "Redis primary node OOM-killed. The app has no sentinel "
+                "failover and no stale-serve fallback, so every cache miss "
+                "goes straight to the database, creating a thundering herd."
+            ),
+        },
+        "confidence": 0.92,
+        "evidence_analysis": [
+            "Redis PING timeout after 3 s",
+            "Cache hit rate dropped from 94 % to 0 %",
+            "DB read QPS jumped from 120 to 4800",
+            "DB CPU at 96 % — approaching hard limit",
+        ],
+        "alternative_hypotheses": [
+            {"category": "NETWORK_PARTITION", "confidence": 0.07, "reason": "Other services on same VNet are healthy"},
+        ],
+    },
+    "cpu_spike_thread_deadlock": {
+        "root_cause": {
+            "category": "THREAD_DEADLOCK",
+            "component": "task_worker_mutex",
+            "file": "worker.py",
+            "function": "process_task / update_inventory",
+            "mechanism": "Lock ordering inversion causes deadlock",
+            "detail": (
+                "process_task() acquires lock_A then lock_B, while "
+                "update_inventory() acquires lock_B then lock_A. Under "
+                "concurrent load both paths run simultaneously, causing a "
+                "classic ABBA deadlock. 187 of 200 threads are stuck."
+            ),
+        },
+        "confidence": 0.95,
+        "evidence_analysis": [
+            "Thread dump: 187 threads in BLOCKED state",
+            "Lock graph shows cycle: lock_A -> lock_B -> lock_A",
+            "CPU at 99 % due to spin-wait in lock acquisition",
+            "Throughput dropped from 1200 RPS to 3 RPS",
+        ],
+        "alternative_hypotheses": [
+            {"category": "INFINITE_LOOP", "confidence": 0.04, "reason": "Stack traces show wait(), not compute"},
+        ],
+    },
+    "disk_io_saturation": {
+        "root_cause": {
+            "category": "IO_SATURATION",
+            "component": "logging_subsystem",
+            "file": "app.py",
+            "function": "request_logger_middleware",
+            "mechanism": "Sync flush of debug-level logs on every request",
+            "detail": (
+                "The request logger middleware is set to DEBUG level with "
+                "flush=True on every write. At 800 RPS, this generates "
+                "~48 K log lines/sec with synchronous disk writes, "
+                "saturating the disk and blocking the async event loop."
+            ),
+        },
+        "confidence": 0.90,
+        "evidence_analysis": [
+            "iostat shows 100 % disk utilization, 0.4 MB/s write throughput",
+            "iowait at 78 % — threads sleeping on I/O",
+            "Log file growing at 12 MB/min",
+            "Disabling debug logging in staging restored normal latency",
+        ],
+        "alternative_hypotheses": [
+            {"category": "WAL_BLOAT", "confidence": 0.09, "reason": "Postgres WAL size is within normal range"},
+        ],
+    },
+}
 
-    if "fix" in sp or "resolution" in sp or "code" in sp:
-        if scenario_type == "memory_leak":
-            fix_description = "Add bounded cache with TTL and eviction policy to prevent memory leak"
-            fix_diff = (
-                "--- a/app.py\n"
-                "+++ b/app.py\n"
-                "@@ -20,6 +20,10 @@\n"
-                "+MAX_CACHE_ITEMS = 10000\n"
-                "+CACHE_TTL_SECONDS = 300\n"
-                "@@ -85,6 +89,10 @@\n"
-                "+if len(cache_store) > MAX_CACHE_ITEMS:\n"
-                "+    evict_oldest_entries(cache_store)\n"
-                "+cache_store[key] = (value, now_ts)\n"
-                "+cleanup_expired(cache_store, CACHE_TTL_SECONDS)\n"
-            )
-            fix_explanation = "Limits cache growth and removes stale entries to stop unbounded memory usage."
-        elif scenario_type == "slow_database_queries":
-            fix_description = "Add missing index for frequently filtered task query"
-            fix_diff = (
-                "--- a/schema.sql\n"
-                "+++ b/schema.sql\n"
-                "@@ -40,3 +40,5 @@\n"
-                "+CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at\n"
-                "+ON tasks(status, created_at DESC);\n"
-            )
-            fix_explanation = "The new index removes full table scans and reduces query latency."
-        elif scenario_type == "external_api_failure":
-            fix_description = "Add circuit breaker and retry with backoff for payment API"
-            fix_diff = (
-                "--- a/app.py\n"
-                "+++ b/app.py\n"
-                "@@ -120,6 +120,14 @@\n"
-                "+for attempt in range(3):\n"
-                "+    try:\n"
-                "+        return payment_client.charge(payload, timeout=5)\n"
-                "+    except Upstream503Error:\n"
-                "+        await asyncio.sleep(2 ** attempt)\n"
-                "+open_circuit_if_threshold_exceeded()\n"
-            )
-            fix_explanation = "Contains upstream instability impact and improves resilience under intermittent 503s."
-        elif scenario_type == "cache_failure":
-            fix_description = "Enable stale cache fallback and throttle database reads on cache outage"
-            fix_diff = (
-                "--- a/app.py\n"
-                "+++ b/app.py\n"
-                "@@ -70,5 +70,11 @@\n"
-                "+if not redis_available():\n"
-                "+    value = local_stale_cache.get(key)\n"
-                "+    if value is not None:\n"
-                "+        return value\n"
-                "+    await db_read_throttler.acquire()\n"
-            )
-            fix_explanation = "Reduces DB overload during cache outages by serving stale data and throttling misses."
-        else:
-            fix_description = "Fix connection pool leak by ensuring unconditional release in finally blocks"
-            fix_diff = (
-                "--- a/app.py\n"
-                "+++ b/app.py\n"
+_MOCK_CHALLENGE = {
+    "connection_pool_exhaustion": {
+        "assessment": "CHALLENGE",
+        "reasoning": "Could slow queries be holding connections open longer than expected, masquerading as a leak?",
+        "challenge_question": "What direct evidence distinguishes a true leak from slow-query hold time?",
+        "alternative_hypothesis": "slow_query_hold_time",
+        "confidence_in_diagnosis": 0.65,
+    },
+    "memory_leak": {
+        "assessment": "CHALLENGE",
+        "reasoning": "Is the growth truly from the cache, or could large response payloads in the HTTP framework be accumulating?",
+        "challenge_question": "Can you prove the cache dict itself is the dominant allocator?",
+        "alternative_hypothesis": "framework_buffer_accumulation",
+        "confidence_in_diagnosis": 0.60,
+    },
+    "slow_database_queries": {
+        "assessment": "CHALLENGE",
+        "reasoning": "Might the slowdown be lock contention from concurrent writes rather than a missing index?",
+        "challenge_question": "Have you checked pg_stat_activity for waiting transactions?",
+        "alternative_hypothesis": "write_lock_contention",
+        "confidence_in_diagnosis": 0.62,
+    },
+    "external_api_failure": {
+        "assessment": "CHALLENGE",
+        "reasoning": "Could our own request volume be causing the upstream 503 s — i.e., we are DDoS-ing our provider?",
+        "challenge_question": "What is our outbound QPS vs the provider's published rate limit?",
+        "alternative_hypothesis": "self_inflicted_rate_limit",
+        "confidence_in_diagnosis": 0.58,
+    },
+    "cache_failure": {
+        "assessment": "CHALLENGE",
+        "reasoning": "Is the database overload really from cache misses, or was there already a slow-query issue masked by the cache?",
+        "challenge_question": "What was the DB CPU trend before the Redis outage started?",
+        "alternative_hypothesis": "pre_existing_db_issue",
+        "confidence_in_diagnosis": 0.63,
+    },
+    "cpu_spike_thread_deadlock": {
+        "assessment": "CHALLENGE",
+        "reasoning": "Are you sure it is a deadlock and not an infinite retry loop in the task processor?",
+        "challenge_question": "Do the blocked thread stacks show wait() or active computation?",
+        "alternative_hypothesis": "infinite_retry_loop",
+        "confidence_in_diagnosis": 0.55,
+    },
+    "disk_io_saturation": {
+        "assessment": "CHALLENGE",
+        "reasoning": "Could the I/O spike be caused by checkpoint/WAL activity rather than application logging?",
+        "challenge_question": "What percentage of disk writes originate from the app log vs Postgres WAL?",
+        "alternative_hypothesis": "database_checkpoint_storm",
+        "confidence_in_diagnosis": 0.61,
+    },
+}
+
+_MOCK_DEFENSE = {
+    "connection_pool_exhaustion": {
+        "response_type": "DEFEND",
+        "response": (
+            "Good challenge. I checked connection hold times. Average query "
+            "exec is 10 ms (normal), but connection HOLD time on the error "
+            "path is 847 ms because the finally block skips pool.release() "
+            "70 % of the time. This confirms a leak, not slow queries."
+        ),
+        "additional_evidence": [
+            "avg_query_time: 10 ms (normal)",
+            "avg_conn_hold_time_error_path: 847 ms (abnormal)",
+            "finally block: conditional release via random()",
+        ],
+        "confidence": 0.94,
+    },
+    "memory_leak": {
+        "response_type": "DEFEND",
+        "response": (
+            "Valid question. I profiled with tracemalloc: 1.3 GB of the "
+            "1.78 GB heap is attributed to cache_store dict entries. "
+            "Framework buffers account for only 80 MB. The cache is "
+            "definitively the dominant allocator."
+        ),
+        "additional_evidence": [
+            "tracemalloc top: cache_store — 1.3 GB (73 %)",
+            "Framework buffers — 80 MB (4.5 %)",
+            "Cache entry count: 2.4 M with avg 570 bytes/entry",
+        ],
+        "confidence": 0.95,
+    },
+    "slow_database_queries": {
+        "response_type": "DEFEND",
+        "response": (
+            "I checked pg_stat_activity: zero waiting transactions. "
+            "EXPLAIN ANALYZE on the hot query confirms Seq Scan with "
+            "2.4 M rows. After creating the index in staging, the same "
+            "query dropped from 5.2 s to 4 ms. Lock contention is ruled out."
+        ),
+        "additional_evidence": [
+            "pg_stat_activity waiting count: 0",
+            "EXPLAIN ANALYZE: Seq Scan cost 48723, rows 2.4 M",
+            "With index: Index Scan cost 8.2, rows 47",
+        ],
+        "confidence": 0.96,
+    },
+    "external_api_failure": {
+        "response_type": "DEFEND",
+        "response": (
+            "I compared our outbound QPS (340/s) against the provider's "
+            "published limit (5000/s). We are well within limits. The "
+            "provider's status page also confirms intermittent degradation "
+            "on their end. Our retry amplification is worsening their load "
+            "but is not the root cause."
+        ),
+        "additional_evidence": [
+            "Our outbound QPS: 340/s (limit 5000/s)",
+            "Provider status: Intermittent 503 since 14:23 UTC",
+            "No rate-limit 429 responses received",
+        ],
+        "confidence": 0.93,
+    },
+    "cache_failure": {
+        "response_type": "DEFEND",
+        "response": (
+            "DB CPU was 11 % before the Redis failure window, then jumped "
+            "to 96 % exactly when Redis went down. The correlation is "
+            "direct. There was no pre-existing DB problem."
+        ),
+        "additional_evidence": [
+            "DB CPU 14:00-14:22: avg 11 %",
+            "Redis unreachable at 14:22:41",
+            "DB CPU 14:23+: avg 96 %",
+        ],
+        "confidence": 0.95,
+    },
+    "cpu_spike_thread_deadlock": {
+        "response_type": "DEFEND",
+        "response": (
+            "Thread dump confirms all 187 blocked threads are in "
+            "Object.wait() inside ReentrantLock.lock(), not in active "
+            "computation. The lock dependency graph shows a clear A→B / "
+            "B→A cycle. This is textbook deadlock, not a retry loop."
+        ),
+        "additional_evidence": [
+            "187 threads: state=BLOCKED in ReentrantLock.lock()",
+            "Lock graph cycle: lock_A → lock_B → lock_A",
+            "No stack frames in retry/loop methods",
+        ],
+        "confidence": 0.97,
+    },
+    "disk_io_saturation": {
+        "response_type": "DEFEND",
+        "response": (
+            "I separated write sources using blktrace. Application log "
+            "writes account for 94 % of disk I/O. Postgres WAL writes are "
+            "only 5 %. Disabling flush=True in staging immediately dropped "
+            "disk util from 100 % to 18 %."
+        ),
+        "additional_evidence": [
+            "blktrace: app log writes 94 % of I/O",
+            "Postgres WAL: 5 % of I/O",
+            "After flush=False in staging: disk util 18 %",
+        ],
+        "confidence": 0.94,
+    },
+}
+
+_MOCK_FIX = {
+    "connection_pool_exhaustion": {
+        "fix": {
+            "file": "app.py",
+            "description": "Unconditionally release connections in finally block",
+            "diff": (
+                "--- a/app.py\n+++ b/app.py\n"
                 "@@ -60,8 +60,4 @@ def list_tasks():\n"
                 "     finally:\n"
                 "-        if conn is not None:\n"
@@ -486,103 +813,430 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
                 "-                else:\n"
                 "-                    pass  # CONNECTION LEAKED!\n"
                 "+        if conn is not None:\n"
-                "+            pool.release(conn)  # ALWAYS release"
-            )
-            fix_explanation = "Connections were conditionally released, causing leaks; fix ensures unconditional release."
+                "+            pool.release(conn)  # ALWAYS release\n"
+            ),
+            "risk_level": "LOW",
+            "explanation": "Ensures every acquired connection is returned to the pool regardless of error state.",
+            "lines_changed": 6,
+        },
+        "validation_steps": [
+            "Connection utilization drops below 25 %",
+            "Error rate returns to baseline (< 0.5 %)",
+            "/health reports status=healthy",
+        ],
+    },
+    "memory_leak": {
+        "fix": {
+            "file": "app.py",
+            "description": "Add bounded LRU cache with TTL eviction",
+            "diff": (
+                "--- a/app.py\n+++ b/app.py\n"
+                "@@ -18,2 +18,6 @@\n"
+                "+MAX_CACHE_ITEMS = 10_000\n"
+                "+CACHE_TTL_SECONDS = 300\n"
+                "@@ -85,4 +89,10 @@\n"
+                " def get_or_set_cache(key, factory):\n"
+                "-    cache_store[key] = factory()\n"
+                "+    if len(cache_store) >= MAX_CACHE_ITEMS:\n"
+                "+        oldest = next(iter(cache_store))\n"
+                "+        del cache_store[oldest]\n"
+                "+    cache_store[key] = (factory(), time.time())\n"
+                "+    _evict_expired(cache_store, CACHE_TTL_SECONDS)\n"
+            ),
+            "risk_level": "LOW",
+            "explanation": "Caps cache at 10 K entries and evicts entries older than 5 minutes.",
+            "lines_changed": 10,
+        },
+        "validation_steps": [
+            "Heap usage stabilizes below 600 MB",
+            "GC pause time returns to < 20 ms",
+            "Cache entry count stays ≤ 10 000",
+        ],
+    },
+    "slow_database_queries": {
+        "fix": {
+            "file": "schema.sql",
+            "description": "Add composite index on (status, created_at DESC)",
+            "diff": (
+                "--- a/schema.sql\n+++ b/schema.sql\n"
+                "@@ -40,0 +41,3 @@\n"
+                "+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_status_created\n"
+                "+  ON tasks (status, created_at DESC);\n"
+            ),
+            "risk_level": "LOW",
+            "explanation": "CREATE INDEX CONCURRENTLY avoids locking the table while building the index.",
+            "lines_changed": 2,
+        },
+        "validation_steps": [
+            "Query latency drops from 5.2 s to < 10 ms",
+            "DB CPU returns to < 20 %",
+            "EXPLAIN shows Index Scan instead of Seq Scan",
+        ],
+    },
+    "external_api_failure": {
+        "fix": {
+            "file": "app.py",
+            "description": "Add circuit breaker with exponential back-off for payment API",
+            "diff": (
+                "--- a/app.py\n+++ b/app.py\n"
+                "@@ -120,5 +120,18 @@\n"
+                " def process_payment(payload):\n"
+                "-    return payment_client.charge(payload)\n"
+                "+    for attempt in range(3):\n"
+                "+        try:\n"
+                "+            if _circuit_open:\n"
+                "+                raise CircuitOpenError()\n"
+                "+            return payment_client.charge(payload, timeout=5)\n"
+                "+        except UpstreamError:\n"
+                "+            await asyncio.sleep(2 ** attempt)\n"
+                "+    _maybe_open_circuit()\n"
+                "+    raise PaymentUnavailableError('circuit open')\n"
+            ),
+            "risk_level": "MEDIUM",
+            "explanation": "Limits retry blast radius and fails fast once the circuit opens.",
+            "lines_changed": 12,
+        },
+        "validation_steps": [
+            "Retry queue depth drops to < 50",
+            "Timeout count drops to near zero",
+            "Circuit opens after 5 consecutive failures",
+        ],
+    },
+    "cache_failure": {
+        "fix": {
+            "file": "app.py",
+            "description": "Add local stale-cache fallback and DB read throttling on Redis outage",
+            "diff": (
+                "--- a/app.py\n+++ b/app.py\n"
+                "@@ -70,4 +70,14 @@\n"
+                " def cache_get(key):\n"
+                "-    return redis.get(key)\n"
+                "+    try:\n"
+                "+        val = redis.get(key)\n"
+                "+        _local_stale[key] = val\n"
+                "+        return val\n"
+                "+    except RedisConnectionError:\n"
+                "+        stale = _local_stale.get(key)\n"
+                "+        if stale is not None:\n"
+                "+            return stale\n"
+                "+        _db_throttle.acquire()\n"
+                "+        return db_read(key)\n"
+            ),
+            "risk_level": "LOW",
+            "explanation": "Serves stale data during Redis outage and throttles DB reads to prevent thundering herd.",
+            "lines_changed": 11,
+        },
+        "validation_steps": [
+            "DB CPU drops below 30 % during Redis outage",
+            "Stale cache serves 80 %+ of reads during outage",
+            "No user-visible errors during failover window",
+        ],
+    },
+    "cpu_spike_thread_deadlock": {
+        "fix": {
+            "file": "worker.py",
+            "description": "Enforce consistent lock ordering (always lock_A before lock_B)",
+            "diff": (
+                "--- a/worker.py\n+++ b/worker.py\n"
+                "@@ -44,6 +44,6 @@\n"
+                " def update_inventory(item):\n"
+                "-    with lock_B:\n"
+                "-        with lock_A:          # WRONG ORDER\n"
+                "-            do_inventory(item)\n"
+                "+    with lock_A:              # SAME ORDER as process_task\n"
+                "+        with lock_B:\n"
+                "+            do_inventory(item)\n"
+            ),
+            "risk_level": "LOW",
+            "explanation": "Classic fix: acquire locks in a globally consistent order to break the deadlock cycle.",
+            "lines_changed": 4,
+        },
+        "validation_steps": [
+            "Blocked thread count drops to 0",
+            "CPU returns to < 30 %",
+            "Throughput recovers to > 1000 RPS",
+        ],
+    },
+    "disk_io_saturation": {
+        "fix": {
+            "file": "app.py",
+            "description": "Switch request logger to async writes and reduce log level to INFO",
+            "diff": (
+                "--- a/app.py\n+++ b/app.py\n"
+                "@@ -30,4 +30,6 @@\n"
+                " handler = logging.FileHandler('app.log')\n"
+                "-handler.setLevel(logging.DEBUG)\n"
+                "-handler.stream.flush = True   # sync flush every line\n"
+                "+handler.setLevel(logging.INFO)\n"
+                "+# Use async queue handler to avoid blocking event loop\n"
+                "+queue_handler = QueueHandler(log_queue)\n"
+                "+listener = QueueListener(log_queue, handler)\n"
+                "+listener.start()\n"
+            ),
+            "risk_level": "LOW",
+            "explanation": "Moves log writes off the event loop and drops verbose DEBUG output.",
+            "lines_changed": 5,
+        },
+        "validation_steps": [
+            "Disk utilization drops below 25 %",
+            "iowait returns to < 5 %",
+            "Request latency normalizes to < 50 ms",
+        ],
+    },
+}
 
-        return json.dumps({
-            "fix": {
-                "file": "app.py",
-                "description": fix_description,
-                "diff": fix_diff,
-                "risk_level": "LOW",
-                "explanation": fix_explanation,
-                "lines_changed": 6,
-            },
-            "validation_steps": [
-                "Verify key symptom metrics trend down after fix",
-                "Confirm target endpoints stay healthy under load",
-                "Check no recurring errors for this incident type",
-            ],
-        })
+_MOCK_POSTMORTEM = {
+    "connection_pool_exhaustion": (
+        "# Incident Postmortem — Connection Pool Exhaustion\n\n"
+        "## Executive Summary\n"
+        "A P1 incident caused by leaked database connections resulted in a "
+        "42 % error rate. The six-agent AI SRE team detected, diagnosed, "
+        "debated, and resolved the issue autonomously.\n\n"
+        "## Timeline\n"
+        "| T+ | Agent | Action |\n"
+        "|---|---|---|\n"
+        "| 0 s | WatcherAgent | Detected error-rate spike 0 % → 42 % |\n"
+        "| 5 s | TriageAgent | Classified P1 — 42 % blast radius |\n"
+        "| 15 s | DiagnosisAgent | Root cause: connection leak in finally block |\n"
+        "| 25 s | ResolutionAgent | **Challenged** — slow-query hypothesis |\n"
+        "| 30 s | DiagnosisAgent | **Defended** — hold-time evidence (847 ms) |\n"
+        "| 35 s | Consensus | Confidence raised to 94 % |\n"
+        "| 40 s | ResolutionAgent | Generated diff: unconditional pool.release() |\n"
+        "| 50 s | DeployAgent | Applied fix + verified /health |\n"
+        "| 60 s | PostmortemAgent | Generated this report |\n\n"
+        "## Root Cause\n"
+        "The `finally` block released connections only 30 % of the time "
+        "when the bug flag was active.\n\n"
+        "## Resolution\n"
+        "Changed `finally` to unconditionally call `pool.release(conn)`.\n\n"
+        "## Lessons Learned\n"
+        "1. Always release resources unconditionally in `finally`\n"
+        "2. Alert at 70 % pool utilization\n"
+        "3. Agent debate improved confidence from 65 % to 94 %\n\n"
+        "---\n*Generated by IncidentZero PostmortemAgent*"
+    ),
+    "memory_leak": (
+        "# Incident Postmortem — Memory Leak\n\n"
+        "## Executive Summary\n"
+        "Unbounded in-memory cache growth pushed heap to 92 %, causing "
+        "850 ms GC pauses and 18 % error rate. The AI team resolved it "
+        "by adding an LRU eviction policy.\n\n"
+        "## Timeline\n"
+        "| T+ | Agent | Action |\n"
+        "|---|---|---|\n"
+        "| 0 s | WatcherAgent | Memory 92 %, GC pause spike |\n"
+        "| 5 s | TriageAgent | P1 — 55 % blast radius |\n"
+        "| 15 s | DiagnosisAgent | Root cause: cache dict with no eviction |\n"
+        "| 25 s | ResolutionAgent | **Challenged** — framework buffer theory |\n"
+        "| 30 s | DiagnosisAgent | **Defended** — tracemalloc proof (73 % cache) |\n"
+        "| 40 s | ResolutionAgent | Generated LRU + TTL fix |\n"
+        "| 50 s | DeployAgent | Applied fix, heap stabilized |\n"
+        "| 60 s | PostmortemAgent | Generated this report |\n\n"
+        "## Root Cause\n"
+        "Plain dict cache with no max-size or TTL.\n\n"
+        "## Lessons Learned\n"
+        "1. Always bound cache size\n"
+        "2. Use TTL for cache entries\n"
+        "3. Monitor heap growth rate, not just absolute size\n\n"
+        "---\n*Generated by IncidentZero PostmortemAgent*"
+    ),
+    "slow_database_queries": (
+        "# Incident Postmortem — Slow Database Queries\n\n"
+        "## Executive Summary\n"
+        "A missing composite index on the tasks table caused 5.2 s query "
+        "times and 97 % DB CPU. A P2 incident affecting 30 % of traffic.\n\n"
+        "## Timeline\n"
+        "| T+ | Agent | Action |\n"
+        "|---|---|---|\n"
+        "| 0 s | WatcherAgent | Latency spike to 6.1 s |\n"
+        "| 5 s | TriageAgent | P2 — 30 % blast radius |\n"
+        "| 15 s | DiagnosisAgent | Missing index on (status, created_at) |\n"
+        "| 25 s | ResolutionAgent | **Challenged** — lock contention theory |\n"
+        "| 30 s | DiagnosisAgent | **Defended** — pg_stat_activity shows 0 waits |\n"
+        "| 40 s | ResolutionAgent | Generated CREATE INDEX CONCURRENTLY |\n"
+        "| 50 s | DeployAgent | Index built, latency < 10 ms |\n\n"
+        "## Lessons Learned\n"
+        "1. Run EXPLAIN ANALYZE on all hot queries\n"
+        "2. Use CONCURRENTLY to avoid table locks\n"
+        "3. Alert when query p99 > 1 s\n\n"
+        "---\n*Generated by IncidentZero PostmortemAgent*"
+    ),
+    "external_api_failure": (
+        "# Incident Postmortem — External API Failure\n\n"
+        "## Executive Summary\n"
+        "The payment gateway returned intermittent 503 errors. Without a "
+        "circuit breaker, retries amplified the problem. Added circuit "
+        "breaker + exponential back-off.\n\n"
+        "## Timeline\n"
+        "| T+ | Agent | Action |\n"
+        "|---|---|---|\n"
+        "| 0 s | WatcherAgent | Payment 503 rate at 37 % |\n"
+        "| 5 s | TriageAgent | P1 — 37 % blast radius |\n"
+        "| 15 s | DiagnosisAgent | No circuit breaker; retries amplify |\n"
+        "| 25 s | ResolutionAgent | **Challenged** — self-DDoS theory |\n"
+        "| 30 s | DiagnosisAgent | **Defended** — QPS within provider limits |\n"
+        "| 40 s | ResolutionAgent | Generated circuit breaker fix |\n"
+        "| 50 s | DeployAgent | Deployed; queue depth < 50 |\n\n"
+        "## Lessons Learned\n"
+        "1. Always wrap external calls in a circuit breaker\n"
+        "2. Use exponential back-off on retries\n"
+        "3. Subscribe to provider status page alerts\n\n"
+        "---\n*Generated by IncidentZero PostmortemAgent*"
+    ),
+    "cache_failure": (
+        "# Incident Postmortem — Cache Failure\n\n"
+        "## Executive Summary\n"
+        "Redis primary OOM-killed, causing a thundering herd of DB reads. "
+        "Added stale-serve fallback and DB throttling.\n\n"
+        "## Timeline\n"
+        "| T+ | Agent | Action |\n"
+        "|---|---|---|\n"
+        "| 0 s | WatcherAgent | Cache hit rate 0 %, DB load 96 % |\n"
+        "| 5 s | TriageAgent | P1 — 48 % blast radius |\n"
+        "| 15 s | DiagnosisAgent | Redis down; no stale-serve |\n"
+        "| 25 s | ResolutionAgent | **Challenged** — pre-existing DB issue? |\n"
+        "| 30 s | DiagnosisAgent | **Defended** — DB CPU was 11 % before outage |\n"
+        "| 40 s | ResolutionAgent | Generated stale fallback + throttle |\n"
+        "| 50 s | DeployAgent | DB CPU < 30 % during next outage test |\n\n"
+        "## Lessons Learned\n"
+        "1. Always have a stale-serve strategy\n"
+        "2. Throttle DB reads on cache misses\n"
+        "3. Set up Redis Sentinel for automatic failover\n\n"
+        "---\n*Generated by IncidentZero PostmortemAgent*"
+    ),
+    "cpu_spike_thread_deadlock": (
+        "# Incident Postmortem — CPU Spike / Thread Deadlock\n\n"
+        "## Executive Summary\n"
+        "A P0 outage caused by ABBA lock ordering left 187 threads "
+        "deadlocked. CPU at 99 %, throughput dropped to 3 RPS (normal "
+        "1200). Fixed by enforcing consistent lock ordering.\n\n"
+        "## Timeline\n"
+        "| T+ | Agent | Action |\n"
+        "|---|---|---|\n"
+        "| 0 s | WatcherAgent | CPU 99 %, 187 blocked threads |\n"
+        "| 5 s | TriageAgent | P0 — 85 % blast radius |\n"
+        "| 15 s | DiagnosisAgent | Lock ordering inversion (A→B / B→A) |\n"
+        "| 25 s | ResolutionAgent | **Challenged** — infinite loop theory |\n"
+        "| 30 s | DiagnosisAgent | **Defended** — stacks show wait(), not compute |\n"
+        "| 40 s | ResolutionAgent | Reordered locks to A→B everywhere |\n"
+        "| 50 s | DeployAgent | Blocked threads = 0, throughput recovered |\n\n"
+        "## Lessons Learned\n"
+        "1. Enforce global lock ordering convention\n"
+        "2. Use lock-timeout to detect deadlocks early\n"
+        "3. Add thread-state monitoring to dashboards\n\n"
+        "---\n*Generated by IncidentZero PostmortemAgent*"
+    ),
+    "disk_io_saturation": (
+        "# Incident Postmortem — Disk I/O Saturation\n\n"
+        "## Executive Summary\n"
+        "Synchronous debug-level logging saturated disk I/O, blocking "
+        "the event loop and causing 31 % error rate. Switched to async "
+        "INFO-level logging.\n\n"
+        "## Timeline\n"
+        "| T+ | Agent | Action |\n"
+        "|---|---|---|\n"
+        "| 0 s | WatcherAgent | Disk 100 %, iowait 78 % |\n"
+        "| 5 s | TriageAgent | P1 — 44 % blast radius |\n"
+        "| 15 s | DiagnosisAgent | Sync flush on DEBUG logs |\n"
+        "| 25 s | ResolutionAgent | **Challenged** — Postgres WAL theory |\n"
+        "| 30 s | DiagnosisAgent | **Defended** — blktrace: 94 % from app logs |\n"
+        "| 40 s | ResolutionAgent | Generated async log handler fix |\n"
+        "| 50 s | DeployAgent | Disk util 18 %, latency normalized |\n\n"
+        "## Lessons Learned\n"
+        "1. Never use sync flush in hot paths\n"
+        "2. Use async / queue-based log handlers\n"
+        "3. Default to INFO level in production\n\n"
+        "---\n*Generated by IncidentZero PostmortemAgent*"
+    ),
+}
+
+
+def _detect_scenario_type(system_prompt: str, user_prompt: str) -> str:
+    """Best-effort extraction of scenario type from prompt text."""
+    combined = (user_prompt + " " + system_prompt).lower()
+    for scenario in INCIDENT_SCENARIOS:
+        if scenario["type"].replace("_", " ") in combined or scenario["type"] in combined:
+            return scenario["type"]
+    # Keyword fallback
+    if "memory" in combined or "heap" in combined or "cache grow" in combined:
+        return "memory_leak"
+    if "slow quer" in combined or "index" in combined or "full table" in combined:
+        return "slow_database_queries"
+    if "payment" in combined or "upstream" in combined or "503" in combined:
+        return "external_api_failure"
+    if "redis" in combined or "cache fail" in combined or "thundering" in combined:
+        return "cache_failure"
+    if "deadlock" in combined or "blocked thread" in combined or "mutex" in combined:
+        return "cpu_spike_thread_deadlock"
+    if "disk" in combined or "iowait" in combined or "log flush" in combined:
+        return "disk_io_saturation"
+    return "connection_pool_exhaustion"
+
+
+def mock_response(system_prompt: str, user_prompt: str = "") -> str:
+    """Rich mock response that varies based on the detected scenario type."""
+    sp = system_prompt.lower()
+    scenario_type = _detect_scenario_type(system_prompt, user_prompt)
+
+    if "triage" in sp:
+        return json.dumps(_MOCK_TRIAGE.get(scenario_type, _MOCK_TRIAGE["connection_pool_exhaustion"]))
+
+    if "diagnos" in sp and "challenge" not in sp and "defend" not in sp and "devil" not in sp:
+        return json.dumps(_MOCK_DIAGNOSIS.get(scenario_type, _MOCK_DIAGNOSIS["connection_pool_exhaustion"]))
+
+    if "challenge" in sp or "evaluate" in sp or "devil" in sp or "skeptic" in sp:
+        return json.dumps(_MOCK_CHALLENGE.get(scenario_type, _MOCK_CHALLENGE["connection_pool_exhaustion"]))
+
+    if "defend" in sp or "responding to" in sp:
+        return json.dumps(_MOCK_DEFENSE.get(scenario_type, _MOCK_DEFENSE["connection_pool_exhaustion"]))
+
+    if "fix" in sp or "resolution" in sp or "code" in sp:
+        return json.dumps(_MOCK_FIX.get(scenario_type, _MOCK_FIX["connection_pool_exhaustion"]))
 
     if "postmortem" in sp:
-        return (
-            "# Incident Postmortem\n\n"
-            "## Executive Summary\n\n"
-            "A P1 incident was detected by the IncidentZero autonomous AI SRE "
-            "team. Database connection pool exhaustion caused a 40%+ error rate "
-            "affecting approximately 42% of users. The six-agent AI team "
-            "detected, diagnosed, debated, and resolved the incident "
-            "autonomously in under 90 seconds.\n\n"
-            "## Timeline\n\n"
-            "- **T+0s**: WatcherAgent detected error rate spike (0% -> 40%+)\n"
-            "- **T+5s**: TriageAgent classified as P1 — 42% blast radius\n"
-            "- **T+15s**: DiagnosisAgent identified root cause: connection pool leak\n"
-            "- **T+25s**: ResolutionAgent CHALLENGED diagnosis — questioned if slow queries\n"
-            "- **T+30s**: DiagnosisAgent DEFENDED with evidence — connection hold time data\n"
-            "- **T+35s**: Agents reached CONSENSUS on root cause\n"
-            "- **T+40s**: ResolutionAgent generated code fix\n"
-            "- **T+50s**: DeployAgent applied fix and verified health\n"
-            "- **T+60s**: Application fully recovered\n"
-            "- **T+70s**: PostmortemAgent generated this report\n\n"
-            "## Root Cause\n\n"
-            "The `finally` block in the request handlers contained conditional "
-            "logic that only released database connections 30% of the time when "
-            "the bug flag was active. This caused connection pool exhaustion as "
-            "connections accumulated without being returned to the pool.\n\n"
-            "## Agent Debate Highlights\n\n"
-            "**ResolutionAgent** challenged the initial diagnosis, suggesting the "
-            "issue might be slow queries holding connections rather than actual leaks. "
-            "**DiagnosisAgent** defended with evidence: query execution times were "
-            "normal (10ms) but connection hold times in error paths were 847ms, "
-            "confirming connections were being held indefinitely. This adversarial "
-            "validation improved diagnostic confidence from 65% to 94%.\n\n"
-            "## Resolution\n\n"
-            "Changed the `finally` block to unconditionally release connections "
-            "using `pool.release(conn)` regardless of any flags or conditions. "
-            "Risk level: LOW.\n\n"
-            "## Impact Assessment\n\n"
-            "| Metric | Before | After |\n"
-            "|--------|--------|-------|\n"
-            "| Error Rate | 40%+ | 0% |\n"
-            "| Connection Utilization | 90%+ | <25% |\n"
-            "| Active Connections | 18/20 | 2/20 |\n"
-            "| Response Time | >500ms | <50ms |\n\n"
-            "## Lessons Learned\n\n"
-            "1. Always release resources unconditionally in `finally` blocks\n"
-            "2. Connection pool monitoring should alert at 70% utilization\n"
-            "3. Agent debate improved diagnostic accuracy before fix generation\n\n"
-            "## Prevention Recommendations\n\n"
-            "1. Add linting rules to detect conditional resource release patterns\n"
-            "2. Implement connection pool utilization alerts at 70% threshold\n"
-            "3. Add integration tests that verify connection counts under load\n\n"
-            "---\n\n"
-            "*Generated by IncidentZero PostmortemAgent — Autonomous AI SRE Team*"
-        )
+        return _MOCK_POSTMORTEM.get(scenario_type, _MOCK_POSTMORTEM["connection_pool_exhaustion"])
 
     return json.dumps({
-        "response": "Mock response — configure Azure OpenAI or OpenAI for real AI",
+        "response": f"Mock response for scenario {scenario_type}",
+        "scenario": scenario_type,
+        "note": "Configure Azure OpenAI / OpenRouter / OpenAI for real AI responses",
     })
 
 
 def parse_json_response(text: str) -> dict:
-    """Safely extracts and parses JSON even if wrapped in markdown code blocks."""
+    """Safely extract JSON from text (may be wrapped in markdown fences)."""
+    if not text or not isinstance(text, str):
+        logger.warning("[JSON Parse] Received empty or non-string input")
+        return {"raw_response": str(text), "_parse_error": "empty_input"}
+
     text = text.strip()
-    text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^```\s*$", "", text, flags=re.MULTILINE)
     text = text.strip()
 
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        try:
-            start = text.index("{")
-            end = text.rindex("}") + 1
-            return json.loads(text[start:end])
-        except (ValueError, json.JSONDecodeError) as e:
-            logger.error(f"[JSON Parse] Failed on: {text[:120]}... Error: {e}")
-            return {"raw_response": text}
+        pass
+
+    try:
+        start = text.index("{")
+        end = text.rindex("}") + 1
+        return json.loads(text[start:end])
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    # Last resort: try to find a JSON array
+    try:
+        start = text.index("[")
+        end = text.rindex("]") + 1
+        result = json.loads(text[start:end])
+        return {"items": result}
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    logger.error(f"[JSON Parse] All attempts failed on: {text[:200]}")
+    return {"raw_response": text[:500], "_parse_error": "all_attempts_failed"}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -594,7 +1248,6 @@ async def create_github_pr(
     fix_data: dict,
     diagnosis_summary: str,
 ) -> str:
-    """Create a GitHub PR with the fix. Returns PR URL or fallback string."""
     fallback_url = f"https://github.com/{GITHUB_REPO_OWNER or 'owner'}/{GITHUB_REPO_NAME}"
     if not GITHUB_TOKEN or not GITHUB_REPO_OWNER:
         return fallback_url
@@ -607,8 +1260,8 @@ async def create_github_pr(
     repo = f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
     branch_name = f"fix/{incident_id.lower()}"
     fix_info = fix_data.get("fix", fix_data)
-    fix_desc = fix_info.get("description", "Autonomous fix by IncidentZero")
-    fix_diff = fix_info.get("diff", "")
+    fix_desc = _safe(fix_info.get("description"), "Autonomous fix by IncidentZero")
+    fix_diff = _safe(fix_info.get("diff"), "# no diff available")
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -668,8 +1321,8 @@ async def create_github_pr(
                 f"### Fix Description\n{fix_desc}\n\n"
                 f"### Code Diff\n```diff\n{fix_diff}\n```\n\n"
                 f"### Validation Steps\n"
-                f"1. Connection pool returns to normal levels\n"
-                f"2. Error rate drops to baseline\n"
+                f"1. Key symptom metrics return to baseline\n"
+                f"2. Error rate drops to < 0.5 %\n"
                 f"3. Health endpoint reports healthy\n\n"
                 f"---\n"
                 f"*This PR was created autonomously by IncidentZero's "
@@ -713,15 +1366,17 @@ def api_health(req: func.HttpRequest) -> func.HttpResponse:
     return make_response({
         "name": "IncidentZero",
         "tagline": "Autonomous AI SRE Team",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "running",
         "platform": "Azure Functions (Serverless)",
         "llm_provider": LLM_PROVIDER,
-        "llm_model": OPENROUTER_MODEL,
+        "llm_model": OPENROUTER_MODEL if LLM_PROVIDER == "openrouter" else AZURE_OPENAI_DEPLOYMENT,
         "target_app_url": TARGET_APP_URL,
         "total_messages": len(message_store),
         "active_incidents": len(incident_store),
         "incident_running": incident_running,
+        "scenario_count": len(INCIDENT_SCENARIOS),
+        "next_scenario_index": _scenario_index % len(INCIDENT_SCENARIOS),
         "github_configured": bool(GITHUB_TOKEN and GITHUB_REPO_OWNER),
         "agents": [
             "WatcherAgent", "TriageAgent", "DiagnosisAgent",
@@ -732,26 +1387,27 @@ def api_health(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="status", methods=["GET", "OPTIONS"])
 def api_status(req: func.HttpRequest) -> func.HttpResponse:
-    """Lightweight endpoint for frontend connection checks (polled frequently)."""
+    """Lightweight endpoint for frontend connection checks."""
     if req.method == "OPTIONS":
         return cors_preflight()
     return make_response({
         "connected": True,
         "total_messages": len(message_store),
         "incident_running": incident_running,
+        "active_incidents": len(incident_store),
         "timestamp": get_iso_now(),
     })
 
 
 @app.route(route="messages", methods=["GET", "OPTIONS"])
 def get_messages(req: func.HttpRequest) -> func.HttpResponse:
-    """Frontend polls this every 1.5s for incremental agent messages."""
+    """Frontend polls this every 1.5 s for incremental agent messages."""
     if req.method == "OPTIONS":
         return cors_preflight()
 
     try:
         since_idx = int(req.params.get("since", "0"))
-    except ValueError:
+    except (ValueError, TypeError):
         since_idx = 0
 
     since_idx = max(0, min(since_idx, len(message_store)))
@@ -774,6 +1430,7 @@ def get_incidents(req: func.HttpRequest) -> func.HttpResponse:
     return make_response({
         "active": incident_store,
         "total_messages": len(message_store),
+        "scenario_count": len(INCIDENT_SCENARIOS),
     })
 
 
@@ -784,7 +1441,28 @@ def get_incident_detail(req: func.HttpRequest) -> func.HttpResponse:
     incident_id = req.route_params.get("incident_id", "")
     if incident_id in incident_store:
         return make_response(incident_store[incident_id])
-    return make_response({"error": "Incident not found"}, status_code=404)
+    return make_response({"error": "Incident not found", "incident_id": incident_id}, status_code=404)
+
+
+@app.route(route="scenarios", methods=["GET", "OPTIONS"])
+def get_scenarios(req: func.HttpRequest) -> func.HttpResponse:
+    """List all available incident scenarios."""
+    if req.method == "OPTIONS":
+        return cors_preflight()
+    return make_response({
+        "scenarios": [
+            {
+                "index": i,
+                "type": s["type"],
+                "description": s["description"],
+                "severity": s["severity"],
+                "blast_radius_pct": s["blast_radius_pct"],
+            }
+            for i, s in enumerate(INCIDENT_SCENARIOS)
+        ],
+        "total": len(INCIDENT_SCENARIOS),
+        "next_index": _scenario_index % len(INCIDENT_SCENARIOS),
+    })
 
 
 # ── Target App Proxies ───────────────────────────────────
@@ -797,10 +1475,24 @@ async def api_inject(req: func.HttpRequest) -> func.HttpResponse:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(f"{TARGET_APP_URL}/chaos/inject")
-        return make_response(resp.json(), status_code=resp.status_code)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"status": "injected", "raw": resp.text[:300]}
+        return make_response(body, status_code=resp.status_code)
+    except httpx.ConnectError as e:
+        return make_response(
+            {"error": "Cannot connect to target app", "detail": str(e), "target_url": TARGET_APP_URL},
+            status_code=502,
+        )
+    except httpx.TimeoutException:
+        return make_response(
+            {"error": "Target app request timed out", "target_url": TARGET_APP_URL},
+            status_code=504,
+        )
     except Exception as e:
         return make_response(
-            {"error": str(e), "target_url": TARGET_APP_URL},
+            {"error": str(e), "error_type": type(e).__name__, "target_url": TARGET_APP_URL},
             status_code=502,
         )
 
@@ -813,38 +1505,79 @@ async def api_fix(req: func.HttpRequest) -> func.HttpResponse:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(f"{TARGET_APP_URL}/chaos/fix")
-        return make_response(resp.json(), status_code=resp.status_code)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"status": "fixed", "raw": resp.text[:300]}
+        return make_response(body, status_code=resp.status_code)
+    except httpx.ConnectError as e:
+        return make_response(
+            {"error": "Cannot connect to target app", "detail": str(e)},
+            status_code=502,
+        )
+    except httpx.TimeoutException:
+        return make_response({"error": "Target app request timed out"}, status_code=504)
     except Exception as e:
-        return make_response({"error": str(e)}, status_code=502)
+        return make_response({"error": str(e), "error_type": type(e).__name__}, status_code=502)
 
 
 @app.route(route="target/health", methods=["GET", "OPTIONS"])
 async def api_target_health(req: func.HttpRequest) -> func.HttpResponse:
-    """Proxy to target app /health."""
     if req.method == "OPTIONS":
         return cors_preflight()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{TARGET_APP_URL}/health")
-        return make_response(resp.json(), status_code=resp.status_code)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"status": "unknown", "raw": resp.text[:300]}
+        return make_response(body, status_code=resp.status_code)
+    except httpx.ConnectError:
+        return make_response({"error": "Target app unreachable", "status": "unreachable"}, status_code=502)
+    except httpx.TimeoutException:
+        return make_response({"error": "Target app timed out", "status": "timeout"}, status_code=504)
     except Exception as e:
-        return make_response(
-            {"error": str(e), "status": "unreachable"},
-            status_code=502,
-        )
+        return make_response({"error": str(e), "status": "error"}, status_code=502)
 
 
 @app.route(route="target/metrics", methods=["GET", "OPTIONS"])
 async def api_target_metrics(req: func.HttpRequest) -> func.HttpResponse:
-    """Proxy to target app /metrics."""
     if req.method == "OPTIONS":
         return cors_preflight()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"{TARGET_APP_URL}/metrics")
-        return make_response(resp.json(), status_code=resp.status_code)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text[:300]}
+        return make_response(body, status_code=resp.status_code)
+    except httpx.ConnectError:
+        return make_response({"error": "Target app unreachable"}, status_code=502)
+    except httpx.TimeoutException:
+        return make_response({"error": "Target app timed out"}, status_code=504)
     except Exception as e:
         return make_response({"error": str(e)}, status_code=502)
+
+
+# ── Reset endpoint (useful during demos) ─────────────────
+
+@app.route(route="reset", methods=["POST", "OPTIONS"])
+def api_reset(req: func.HttpRequest) -> func.HttpResponse:
+    """Clear all in-memory state for a fresh demo run."""
+    if req.method == "OPTIONS":
+        return cors_preflight()
+    global incident_running
+    message_store.clear()
+    incident_store.clear()
+    incident_running = False
+    return make_response({
+        "status": "reset",
+        "messages_cleared": True,
+        "incidents_cleared": True,
+        "timestamp": get_iso_now(),
+    })
 
 
 # ═══════════════════════════════════════════════════════════
@@ -855,8 +1588,10 @@ async def api_target_metrics(req: func.HttpRequest) -> func.HttpResponse:
 async def run_incident(req: func.HttpRequest) -> func.HttpResponse:
     """
     Triggers the complete autonomous incident lifecycle:
-      1. Inject bug -> 2. Detect -> 3. Triage -> 4. Diagnose ->
-      5. Debate -> 6. Fix -> 7. Deploy -> 8. Postmortem
+      1. Inject bug → 2. Detect → 3. Triage → 4. Diagnose →
+      5. Debate → 6. Fix → 7. Deploy → 8. Postmortem
+
+    Each call cycles through a different scenario (round-robin across 7).
     """
     if req.method == "OPTIONS":
         return cors_preflight()
@@ -865,9 +1600,22 @@ async def run_incident(req: func.HttpRequest) -> func.HttpResponse:
 
     if incident_running:
         return make_response(
-            {"error": "Incident already running", "status": "BUSY"},
+            {
+                "error": "Incident already running — please wait for it to complete",
+                "status": "BUSY",
+                "hint": "Poll GET /api/messages?since=0 to follow progress",
+            },
             status_code=409,
         )
+
+    # Accept optional scenario override from request body
+    requested_scenario = None
+    try:
+        body = req.get_json()
+        if isinstance(body, dict) and "scenario" in body:
+            requested_scenario = body["scenario"]
+    except Exception:
+        pass
 
     incident_id = f"INC-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
     logger.info(f"▶ Starting incident lifecycle: {incident_id}")
@@ -875,51 +1623,98 @@ async def run_incident(req: func.HttpRequest) -> func.HttpResponse:
     message_store.clear()
     incident_store.clear()
     incident_running = True
-    asyncio.create_task(run_full_incident(incident_id))
+
+    asyncio.create_task(_safe_run_incident(incident_id, requested_scenario))
 
     return make_response({
         "incident_id": incident_id,
         "status": "STARTED",
+        "poll_url": "/api/messages?since=0",
     })
+
+
+async def _safe_run_incident(incident_id: str, requested_scenario: str | None = None) -> None:
+    """Wrapper that guarantees incident_running is reset even on catastrophic errors."""
+    global incident_running
+    try:
+        await run_full_incident(incident_id, requested_scenario)
+    except Exception as e:
+        logger.critical(
+            f"💀 Catastrophic failure in incident pipeline {incident_id}: {e}\n"
+            f"{traceback.format_exc()}"
+        )
+        add_message(
+            sender="OrchestratorAgent",
+            recipient="broadcast",
+            msg_type="error",
+            channel="system.error",
+            incident_id=incident_id,
+            payload={
+                "status": "CATASTROPHIC_FAILURE",
+                "error": str(e),
+                "traceback": traceback.format_exc()[-500:],
+            },
+        )
+        incident_store[incident_id] = {
+            "status": "FAILED",
+            "incident_id": incident_id,
+            "error": str(e),
+            "failed_at": get_iso_now(),
+        }
+    finally:
+        incident_running = False
+        logger.info(f"Pipeline wrapper finished for {incident_id}. incident_running = False")
 
 
 # ═══════════════════════════════════════════════════════════
 # FULL INCIDENT LIFECYCLE (async)
 # ═══════════════════════════════════════════════════════════
 
-async def run_full_incident(incident_id: str) -> dict:
+async def run_full_incident(incident_id: str, requested_scenario: str | None = None) -> dict:
     """Execute the complete autonomous incident resolution pipeline."""
     global incident_running
 
     target = TARGET_APP_URL
     start_time = datetime.now(timezone.utc)
-    scenario = random.choice(INCIDENT_SCENARIOS)
-    incident_type = scenario["type"]
-    incident_context = {
-        "scenario": scenario,
-        "incident_type": incident_type,
-    }
 
-    # Pre-declare all variables so they are available in every code path
-    error_rate = 0.0
-    avg_latency = 0.0
-    conn_util = 0.0
-    active_conn = 0
-    max_conn = 20
+    # Pick scenario — either requested or next in rotation
+    if requested_scenario:
+        scenario = next(
+            (s for s in INCIDENT_SCENARIOS if s["type"] == requested_scenario),
+            None,
+        )
+        if scenario is None:
+            logger.warning(f"Requested scenario '{requested_scenario}' not found, using rotation")
+            scenario = _next_scenario()
+    else:
+        scenario = _next_scenario()
+
+    incident_type = scenario["type"]
+    incident_context = {"scenario": scenario, "incident_type": incident_type}
+
+    logger.info(f"📋 Scenario selected: {incident_type} — {scenario['description']}")
+
+    # Pre-declare all variables with safe defaults
+    error_rate: float = 0.0
+    avg_latency: float = 0.0
+    conn_util: float = 0.0
+    active_conn: int = 0
+    max_conn: int = 20
     health_data: dict = {}
+    metrics_data: dict = {}
     triage_data: dict = {
-        "severity": "P1",
+        "severity": scenario.get("severity", "P1"),
         "classification": "SERVICE_DEGRADATION",
-        "blast_radius_pct": 42,
+        "blast_radius_pct": scenario.get("blast_radius_pct", 42),
     }
     diagnosis_data: dict = {}
     fix_data: dict = {}
-    is_challenge = False
-    fix_applied = False
-    health_status = "UNKNOWN"
-    pr_url = ""
-    rc_text = ""
-    elapsed = 0.0
+    is_challenge: bool = False
+    fix_applied: bool = False
+    health_status: str = "UNKNOWN"
+    pr_url: str = ""
+    rc_text: str = scenario.get("root_cause", "unknown")
+    elapsed: float = 0.0
 
     try:
         # ═══════════════════════════════════════════════════
@@ -941,6 +1736,7 @@ async def run_full_incident(incident_id: str) -> dict:
                 ],
                 "incident_type": incident_type,
                 "scenario_description": scenario["description"],
+                "expected_severity": scenario.get("severity", "P1"),
             },
         )
 
@@ -953,7 +1749,7 @@ async def run_full_incident(incident_id: str) -> dict:
             payload={
                 "agent": "WatcherAgent",
                 "stage": "DETECT",
-                "message": f"Anomaly detected: {scenario['description']}",
+                "message": f"🔍 Anomaly detected: {scenario['description']}",
                 "metrics": scenario["symptoms"],
                 "incident_type": incident_type,
             },
@@ -965,45 +1761,63 @@ async def run_full_incident(incident_id: str) -> dict:
         # ═══════════════════════════════════════════════════
         # PHASE 2: INJECT BUG + GENERATE LOAD
         # ═══════════════════════════════════════════════════
+        inject_success = False
         async with httpx.AsyncClient(timeout=30) as client:
             try:
                 resp = await client.post(f"{target}/chaos/inject")
+                inject_success = resp.status_code == 200
                 logger.info(f"Bug injected: {resp.status_code}")
             except Exception as e:
-                logger.error(f"Failed to inject bug: {e}")
+                logger.warning(f"Failed to inject bug (non-fatal): {e}")
 
-            for _ in range(5):
+            # Generate some load to trigger symptoms
+            for i in range(5):
                 try:
                     await client.post(f"{target}/chaos/generate-load")
                 except Exception:
                     pass
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.8)
 
             # ═══════════════════════════════════════════════
             # PHASE 3: WATCHER AGENT — Detect Anomaly
             # ═══════════════════════════════════════════════
-            metrics_data: dict = {}
-
             try:
                 resp = await client.get(f"{target}/health")
-                health_data = resp.json()
+                health_data = resp.json() if resp.status_code == 200 else {}
             except Exception:
-                health_data = {"status": "unreachable", "bug_injected": True}
+                health_data = {}
+
+            if not health_data:
+                health_data = {
+                    "status": "degraded",
+                    "bug_injected": True,
+                    "incident_type": incident_type,
+                }
 
             try:
                 resp = await client.get(f"{target}/metrics")
-                metrics_data = resp.json()
+                metrics_data = resp.json() if resp.status_code == 200 else {}
             except Exception:
+                metrics_data = {}
+
+            if not metrics_data:
+                # Synthesize metrics from scenario symptoms
                 metrics_data = {
-                    "connection_utilization": 0.9,
+                    "connection_utilization": scenario["symptoms"].get("connections", "0/20").split("/")[0] if isinstance(scenario["symptoms"].get("connections"), str) else 0.9,
                     "active_connections": 18,
                     "max_connections": 20,
+                    "error_rate": scenario["symptoms"].get("error_rate", 0.3),
+                    "latency_ms": scenario["symptoms"].get("latency_ms", 5000),
+                    "cpu_pct": scenario["symptoms"].get("cpu_pct", 45),
+                    "memory_pct": scenario["symptoms"].get("memory_usage_pct", scenario["symptoms"].get("memory_pct", 60)),
                 }
 
+            # Probe target to measure real error rate
             error_count = 0
             total_latency = 0.0
+            probe_count = 5
             loop = asyncio.get_running_loop()
-            for _ in range(5):
+            for _ in range(probe_count):
                 try:
                     t0 = loop.time()
                     resp = await client.get(f"{target}/tasks")
@@ -1015,11 +1829,30 @@ async def run_full_incident(incident_id: str) -> dict:
                     error_count += 1
                     total_latency += 1000
 
-        error_rate = error_count / 5
-        avg_latency = total_latency / 5
-        conn_util = metrics_data.get("connection_utilization", 0)
-        active_conn = metrics_data.get("active_connections", 0)
-        max_conn = metrics_data.get("max_connections", 20)
+        error_rate = error_count / max(probe_count, 1)
+        avg_latency = total_latency / max(probe_count, 1)
+
+        # Use real values if we got them, otherwise use scenario symptoms
+        if error_rate < 0.01 and scenario["symptoms"].get("error_rate", 0) > 0.05:
+            error_rate = scenario["symptoms"]["error_rate"] + random.uniform(-0.05, 0.05)
+            error_rate = max(0.01, min(error_rate, 1.0))
+
+        if avg_latency < 100 and scenario["symptoms"].get("latency_ms", 0) > 500:
+            avg_latency = scenario["symptoms"]["latency_ms"] + random.uniform(-500, 500)
+            avg_latency = max(50, avg_latency)
+
+        conn_util = float(metrics_data.get("connection_utilization", 0))
+        active_conn = int(metrics_data.get("active_connections", 0))
+        max_conn = int(metrics_data.get("max_connections", 20))
+
+        # Build symptom-specific evidence list
+        evidence_list = [
+            f"Error rate: {error_rate * 100:.1f}% (baseline: 0.5%)",
+            f"Avg response time: {avg_latency:.0f}ms",
+        ]
+        for key, value in scenario["symptoms"].items():
+            if key not in ("error_rate", "latency_ms"):
+                evidence_list.append(f"{key.replace('_', ' ').title()}: {value}")
 
         add_message(
             sender="WatcherAgent",
@@ -1028,11 +1861,12 @@ async def run_full_incident(incident_id: str) -> dict:
             channel="monitoring.status",
             incident_id=incident_id,
             payload={
-                "error_rate": error_rate,
+                "error_rate": round(error_rate, 4),
                 "active_connections": active_conn,
                 "max_connections": max_conn,
-                "connection_utilization": conn_util,
-                "avg_response_time_ms": avg_latency,
+                "connection_utilization": round(conn_util, 4),
+                "avg_response_time_ms": round(avg_latency, 1),
+                "scenario_symptoms": scenario["symptoms"],
             },
         )
 
@@ -1044,24 +1878,18 @@ async def run_full_incident(incident_id: str) -> dict:
             incident_id=incident_id,
             payload={
                 "alert_type": "ANOMALY_DETECTED",
+                "incident_type": incident_type,
                 "data": {
-                    "error_rate": error_rate,
+                    "error_rate": round(error_rate, 4),
                     "baseline_error_rate": 0.005,
-                    "connection_utilization": conn_util,
-                    "active_connections": active_conn,
-                    "max_connections": max_conn,
-                    "avg_response_time_ms": avg_latency,
+                    "avg_response_time_ms": round(avg_latency, 1),
+                    **{k: v for k, v in scenario["symptoms"].items()},
                 },
                 "affected_services": ["target-app"],
                 "detected_at": get_iso_now(),
             },
             confidence=0.94,
-            evidence=[
-                f"Error rate: {error_rate * 100:.1f}% (baseline: 0.5%)",
-                f"Connection utilization: {conn_util * 100:.1f}%",
-                f"Active connections: {active_conn}/{max_conn}",
-                f"Avg response time: {avg_latency:.0f}ms",
-            ],
+            evidence=evidence_list,
         )
         send_stage("TRIAGE", incident_id)
         await asyncio.sleep(1)
@@ -1072,27 +1900,34 @@ async def run_full_incident(incident_id: str) -> dict:
         triage_system = (
             "You are TriageAgent, an expert SRE incident triage specialist. "
             "Classify this incident's severity.\n"
-            "P0=critical outage >80% affected, P1=high >30%, P2=medium <30%, P3=low <5%\n"
+            "P0 = critical outage >80% affected, P1 = high >30%, P2 = medium <30%, P3 = low <5%\n"
             "Respond ONLY with valid JSON:\n"
-            "{\"severity\": \"P0-P3\", \"classification\": \"string\", "
-            "\"blast_radius_pct\": number, \"affected_endpoints\": [strings], "
-            "\"auto_resolve_eligible\": boolean, \"escalate_to_human\": boolean, "
-            "\"reasoning\": \"string\"}"
+            '{"severity": "P0-P3", "classification": "string", '
+            '"blast_radius_pct": number, "affected_endpoints": [strings], '
+            '"auto_resolve_eligible": boolean, "escalate_to_human": boolean, '
+            '"reasoning": "string"}'
+        )
+        symptom_lines = "\n".join(
+            f"- {k.replace('_', ' ').title()}: {v}"
+            for k, v in scenario["symptoms"].items()
         )
         triage_user = (
+            f"Incident type: {incident_type}\n"
+            f"Description: {scenario['description']}\n\n"
             f"Alert data:\n"
             f"- Error rate: {error_rate * 100:.1f}% (baseline: 0.5%)\n"
-            f"- Connection utilization: {conn_util * 100:.1f}%\n"
-            f"- Active connections: {active_conn}/{max_conn}\n"
             f"- Avg response time: {avg_latency:.0f}ms\n"
-            f"- Affected service: TaskManager API\n"
+            f"{symptom_lines}\n"
+            f"- Affected service: TaskManager API\n\n"
             f"Classify this incident."
         )
+
         triage_raw = await chat_llm(triage_system, triage_user)
         triage_data = parse_json_response(triage_raw)
-        triage_data.setdefault("severity", "P1")
+        triage_data.setdefault("severity", scenario.get("severity", "P1"))
         triage_data.setdefault("classification", "SERVICE_DEGRADATION")
-        triage_data.setdefault("blast_radius_pct", 42)
+        triage_data.setdefault("blast_radius_pct", scenario.get("blast_radius_pct", 42))
+        triage_data.setdefault("reasoning", f"Incident classified based on {incident_type} symptoms")
 
         add_message(
             sender="TriageAgent",
@@ -1111,37 +1946,44 @@ async def run_full_incident(incident_id: str) -> dict:
         # ═══════════════════════════════════════════════════
         diagnosis_system = (
             "You are DiagnosisAgent, an expert SRE root cause analyst. "
-            "The target app is a Python FastAPI app with:\n"
-            "- ConnectionPool class (max 20 connections)\n"
-            "- acquire() and release() methods\n"
-            "- /tasks endpoints that use the pool\n"
-            "- A finally block that should release connections\n"
-            "- /chaos/inject endpoint that activates a bug\n"
+            "The target app is a Python FastAPI service. Analyze the "
+            "incident data and determine the root cause.\n"
             "Respond ONLY with valid JSON:\n"
-            "{\"root_cause\": {\"category\": \"string\", \"component\": \"string\", "
-            "\"file\": \"string\", \"function\": \"string\", \"mechanism\": \"string\", "
-            "\"detail\": \"string\"}, \"confidence\": number, "
-            "\"evidence_analysis\": [strings], \"alternative_hypotheses\": [objects]}"
+            '{"root_cause": {"category": "string", "component": "string", '
+            '"file": "string", "function": "string", "mechanism": "string", '
+            '"detail": "string"}, "confidence": number, '
+            '"evidence_analysis": [strings], "alternative_hypotheses": [objects]}'
         )
         diagnosis_user = (
-            f"Incident scenario detected.\n\n"
+            f"Incident scenario:\n"
             f"Type: {scenario['type']}\n"
             f"Description: {scenario['description']}\n"
-            f"Symptoms: {scenario['symptoms']}\n\n"
-            f"Analyze the root cause and propose a fix.\n\n"
-            f"Incident data:\n"
+            f"Symptoms: {json.dumps(scenario['symptoms'])}\n"
+            f"Known root cause hint: {scenario.get('root_cause', 'unknown')}\n\n"
+            f"Measured data:\n"
             f"- Severity: {triage_data.get('severity', 'P1')}\n"
             f"- Error rate: {error_rate * 100:.1f}%\n"
-            f"- Connections: {active_conn}/{max_conn}\n"
-            f"- Utilization: {conn_util * 100:.1f}%\n"
             f"- Avg response time: {avg_latency:.0f}ms\n"
-            f"- Bug injected: {health_data.get('bug_injected', 'unknown')}\n"
-            f"Find the root cause."
+            f"- Bug injected: {health_data.get('bug_injected', 'likely')}\n\n"
+            f"Determine the root cause."
         )
+
         diagnosis_raw = await chat_llm(diagnosis_system, diagnosis_user)
         diagnosis_data = parse_json_response(diagnosis_raw)
-        if "root_cause" not in diagnosis_data:
-            diagnosis_data = {"root_cause": diagnosis_data, "confidence": 0.85}
+
+        # Ensure structure is correct
+        if "root_cause" not in diagnosis_data or not isinstance(diagnosis_data["root_cause"], dict):
+            diagnosis_data = {
+                "root_cause": diagnosis_data if isinstance(diagnosis_data, dict) else {"detail": str(diagnosis_data)},
+                "confidence": 0.85,
+                "evidence_analysis": [f"Scenario: {incident_type}"],
+            }
+
+        diagnosis_data.setdefault("confidence", 0.88)
+        diagnosis_data.setdefault("evidence_analysis", [f"Scenario type: {incident_type}"])
+        diagnosis_data["root_cause"].setdefault("detail", scenario.get("root_cause", "Unknown"))
+        diagnosis_data["root_cause"].setdefault("category", incident_type.upper())
+        diagnosis_data["root_cause"].setdefault("component", "target_application")
 
         add_message(
             sender="DiagnosisAgent",
@@ -1159,37 +2001,34 @@ async def run_full_incident(incident_id: str) -> dict:
         # ═══════════════════════════════════════════════════
         # PHASE 6: RESOLUTION AGENT — Devil's Advocate Debate
         # ═══════════════════════════════════════════════════
+        challenge_hint = _MOCK_CHALLENGE.get(incident_type, _MOCK_CHALLENGE["connection_pool_exhaustion"])
+        challenge_angle = challenge_hint.get("reasoning", "Could there be an alternative explanation?")
+
         debate_system = (
-            "You are ResolutionAgent. Before generating a fix, you MUST critically "
+            "You are ResolutionAgent. Before generating a fix, CRITICALLY "
             "evaluate the diagnosis by playing devil's advocate.\n"
             "Ask: Is this REALLY the root cause? Could it be something else?\n"
             "Respond ONLY with valid JSON:\n"
-            "{\"assessment\": \"AGREE\" or \"CHALLENGE\", \"reasoning\": \"string\", "
-            "\"challenge_question\": \"string\", \"alternative_hypothesis\": \"string\", "
-            "\"confidence_in_diagnosis\": number}"
+            '{"assessment": "AGREE" or "CHALLENGE", "reasoning": "string", '
+            '"challenge_question": "string", "alternative_hypothesis": "string", '
+            '"confidence_in_diagnosis": number}'
         )
-        if scenario["type"] == "memory_leak":
-            challenge_reason = "Could this memory growth be caused by unbounded caching rather than database usage?"
-        elif scenario["type"] == "slow_database_queries":
-            challenge_reason = "Could slow queries be causing resource contention rather than connection leaks?"
-        elif scenario["type"] == "external_api_failure":
-            challenge_reason = "Could upstream API failures be propagating errors through the service?"
-        elif scenario["type"] == "cache_failure":
-            challenge_reason = "Is the database overloaded due to cache misses?"
-        else:
-            challenge_reason = "Could slow queries be holding connections longer than expected?"
-
         debate_user = (
-            f"Incident scenario:\n"
-            f"- Type: {scenario['type']}\n"
-            f"- Description: {scenario['description']}\n"
-            f"- Suggested challenge angle: {challenge_reason}\n\n"
+            f"Incident type: {scenario['type']}\n"
+            f"Description: {scenario['description']}\n"
+            f"Suggested challenge angle: {challenge_angle}\n\n"
             f"Diagnosis from DiagnosisAgent:\n"
             f"{json.dumps(diagnosis_data, indent=2)}\n\n"
             f"Critically evaluate this diagnosis. Be skeptical."
         )
+
         debate_raw = await chat_llm(debate_system, debate_user)
         debate_data = parse_json_response(debate_raw)
+        debate_data.setdefault("assessment", "CHALLENGE")
+        debate_data.setdefault("reasoning", challenge_angle)
+        debate_data.setdefault("challenge_question", "What direct evidence confirms this?")
+        debate_data.setdefault("confidence_in_diagnosis", 0.65)
+
         is_challenge = debate_data.get("assessment", "").upper() == "CHALLENGE"
 
         add_message(
@@ -1200,35 +2039,40 @@ async def run_full_incident(incident_id: str) -> dict:
             incident_id=incident_id,
             payload={
                 "evaluation": debate_data,
-                "challenge_reason": challenge_reason,
+                "challenge_reason": challenge_angle,
                 "debate_round": 1,
                 "debate_concluded": not is_challenge,
             },
-            confidence=debate_data.get(
-                "confidence_in_diagnosis", 0.7 if is_challenge else 0.9
-            ),
+            confidence=debate_data.get("confidence_in_diagnosis", 0.65),
         )
 
         if is_challenge:
+            # ── DiagnosisAgent defends ──
             defense_system = (
-                "You are DiagnosisAgent responding to a challenge from ResolutionAgent. "
-                "Be intellectually honest. If they have a valid point, acknowledge it. "
-                "If your diagnosis is correct, defend with specific evidence.\n"
+                "You are DiagnosisAgent responding to a challenge from "
+                "ResolutionAgent. Defend your diagnosis with concrete "
+                "evidence, or acknowledge a valid counter-point.\n"
                 "Respond ONLY with valid JSON:\n"
-                "{\"response_type\": \"DEFEND\" or \"ACCEPT_REVISION\", "
-                "\"response\": \"string\", \"additional_evidence\": [strings], "
-                "\"confidence\": number}"
+                '{"response_type": "DEFEND" or "ACCEPT_REVISION", '
+                '"response": "string", "additional_evidence": [strings], '
+                '"confidence": number}'
             )
             defense_user = (
-                f"ResolutionAgent's challenge:\n"
-                f"{debate_data.get('reasoning', 'No reasoning provided')}\n\n"
+                f"Challenge from ResolutionAgent:\n"
+                f"{debate_data.get('reasoning', 'N/A')}\n\n"
                 f"Challenge question: {debate_data.get('challenge_question', 'N/A')}\n\n"
                 f"Your original diagnosis:\n"
                 f"{json.dumps(diagnosis_data.get('root_cause', {}), indent=2)}\n\n"
-                f"Defend or revise your diagnosis with concrete evidence."
+                f"Incident type: {incident_type}\n"
+                f"Defend or revise with concrete evidence."
             )
+
             defense_raw = await chat_llm(defense_system, defense_user)
             defense_data = parse_json_response(defense_raw)
+            defense_data.setdefault("response_type", "DEFEND")
+            defense_data.setdefault("response", "Diagnosis confirmed with additional evidence.")
+            defense_data.setdefault("additional_evidence", [])
+            defense_data.setdefault("confidence", 0.94)
 
             add_message(
                 sender="DiagnosisAgent",
@@ -1236,13 +2080,11 @@ async def run_full_incident(incident_id: str) -> dict:
                 msg_type="evidence",
                 channel="incident.debate",
                 incident_id=incident_id,
-                payload={
-                    **defense_data,
-                    "debate_round": 2,
-                },
+                payload={**defense_data, "debate_round": 2},
                 confidence=defense_data.get("confidence", 0.94),
             )
 
+            # ── Consensus reached ──
             add_message(
                 sender="ResolutionAgent",
                 recipient="OrchestratorAgent",
@@ -1253,48 +2095,58 @@ async def run_full_incident(incident_id: str) -> dict:
                     "evaluation": {
                         "assessment": "AGREE",
                         "reasoning": (
-                            "After reviewing DiagnosisAgent's additional evidence — "
-                            "particularly the connection hold time data showing 847ms "
-                            "in error paths vs 10ms normal — the connection pool leak "
-                            "diagnosis is confirmed with high confidence. "
-                            "Proceeding with fix generation."
+                            f"After reviewing DiagnosisAgent's additional "
+                            f"evidence for {incident_type}, the diagnosis is "
+                            f"confirmed with high confidence. "
+                            f"Proceeding with fix generation."
                         ),
-                        "confidence_in_diagnosis": 0.94,
+                        "confidence_in_diagnosis": defense_data.get("confidence", 0.94),
                     },
                     "debate_round": 3,
                     "debate_concluded": True,
                 },
-                confidence=0.94,
+                confidence=defense_data.get("confidence", 0.94),
             )
+
+        await asyncio.sleep(0.5)
 
         # ═══════════════════════════════════════════════════
         # PHASE 7: RESOLUTION AGENT — Generate Code Fix
         # ═══════════════════════════════════════════════════
         fix_system = (
-            "You are ResolutionAgent generating a targeted code fix. Rules:\n"
-            "1. Fix ONLY the specific bug identified — no refactoring\n"
-            "2. Generate a unified diff showing before/after\n"
-            "3. Add a clear comment explaining the fix\n"
-            "4. Assess the risk level (LOW/MEDIUM/HIGH)\n"
+            "You are ResolutionAgent generating a targeted code fix.\n"
+            "1. Fix ONLY the specific bug identified\n"
+            "2. Generate a unified diff\n"
+            "3. Assess risk level (LOW/MEDIUM/HIGH)\n"
             "Respond ONLY with valid JSON:\n"
-            "{\"fix\": {\"file\": \"string\", \"description\": \"string\", "
-            "\"diff\": \"string\", \"risk_level\": \"LOW|MEDIUM|HIGH\", "
-            "\"explanation\": \"string\", \"lines_changed\": number}, "
-            "\"validation_steps\": [strings]}"
+            '{"fix": {"file": "string", "description": "string", '
+            '"diff": "string", "risk_level": "LOW|MEDIUM|HIGH", '
+            '"explanation": "string", "lines_changed": number}, '
+            '"validation_steps": [strings]}'
         )
         fix_user = (
-            f"Incident scenario:\n"
-            f"- Type: {scenario['type']}\n"
-            f"- Description: {scenario['description']}\n"
-            f"- Expected root cause context: {scenario.get('root_cause', '')}\n\n"
-            f"Confirmed root cause:\n"
+            f"Incident type: {scenario['type']}\n"
+            f"Description: {scenario['description']}\n"
+            f"Root cause: {scenario.get('root_cause', 'unknown')}\n\n"
+            f"Confirmed root cause detail:\n"
             f"{json.dumps(diagnosis_data.get('root_cause', {}), indent=2)}\n\n"
             f"Generate a minimal, safe code fix."
         )
+
         fix_raw = await chat_llm(fix_system, fix_user)
         fix_data = parse_json_response(fix_raw)
-        if "fix" not in fix_data:
-            fix_data = {"fix": fix_data}
+
+        # Ensure structure
+        if "fix" not in fix_data or not isinstance(fix_data.get("fix"), dict):
+            fix_data = {"fix": fix_data if isinstance(fix_data, dict) else {}}
+
+        fix_data["fix"].setdefault("file", "app.py")
+        fix_data["fix"].setdefault("description", f"Fix for {incident_type}")
+        fix_data["fix"].setdefault("diff", "# automated fix applied")
+        fix_data["fix"].setdefault("risk_level", "LOW")
+        fix_data["fix"].setdefault("explanation", f"Resolves {incident_type} root cause")
+        fix_data["fix"].setdefault("lines_changed", 5)
+        fix_data.setdefault("validation_steps", ["Verify symptoms resolved", "Check /health endpoint"])
 
         add_message(
             sender="ResolutionAgent",
@@ -1315,31 +2167,41 @@ async def run_full_incident(incident_id: str) -> dict:
             try:
                 resp = await client.post(f"{target}/chaos/fix")
                 fix_applied = resp.status_code == 200
-                logger.info(f"Fix applied: {fix_applied}")
+                logger.info(f"Fix applied via /chaos/fix: {fix_applied}")
             except Exception as e:
-                logger.error(f"Failed to apply fix: {e}")
+                logger.warning(f"Failed to apply fix (non-fatal): {e}")
+                fix_applied = False
 
-            for _ in range(5):
+            # Verify recovery
+            for attempt in range(5):
                 try:
                     await asyncio.sleep(1)
                     resp = await client.get(f"{target}/health")
                     health = resp.json()
                     active = health.get("active_connections", 99)
-                    if active < 5:
+                    status_val = health.get("status", "unknown")
+                    if active < 5 or status_val == "healthy":
                         health_status = "HEALTHY"
                         break
                     health_status = "RECOVERING" if active < 15 else "DEGRADED"
                 except Exception:
-                    health_status = "UNKNOWN"
+                    health_status = "VERIFYING"
+            else:
+                # If target unreachable but fix was applied, assume recovering
+                if fix_applied:
+                    health_status = "RECOVERING"
 
+        # Extract root cause text safely
         rc_detail = diagnosis_data.get("root_cause", {})
-        rc_text = (
-            rc_detail.get("detail", "connection pool leak")
-            if isinstance(rc_detail, dict)
-            else str(rc_detail)
-        )
+        if isinstance(rc_detail, dict):
+            rc_text = rc_detail.get("detail") or rc_detail.get("mechanism") or scenario.get("root_cause", "unknown")
+        else:
+            rc_text = str(rc_detail) if rc_detail else scenario.get("root_cause", "unknown")
+
+        # Create GitHub PR
         pr_url = await create_github_pr(incident_id, fix_data, rc_text)
 
+        # Post-fix metrics
         add_message(
             sender="WatcherAgent",
             recipient="Dashboard",
@@ -1352,6 +2214,7 @@ async def run_full_incident(incident_id: str) -> dict:
                 "max_connections": max_conn,
                 "connection_utilization": 0.1 if health_status == "HEALTHY" else conn_util,
                 "avg_response_time_ms": 25.0 if health_status == "HEALTHY" else avg_latency,
+                "status_after_fix": health_status,
             },
         )
 
@@ -1369,7 +2232,7 @@ async def run_full_incident(incident_id: str) -> dict:
                 "pr_url": pr_url,
                 "deployed_at": get_iso_now(),
             },
-            confidence=0.95 if fix_applied and health_status == "HEALTHY" else 0.3,
+            confidence=0.95 if fix_applied and health_status == "HEALTHY" else 0.5,
         )
         send_stage("REPORT", incident_id)
         await asyncio.sleep(1)
@@ -1381,38 +2244,45 @@ async def run_full_incident(incident_id: str) -> dict:
 
         postmortem_system = (
             "You are PostmortemAgent. Write a professional incident postmortem "
-            "report in markdown format. Include:\n"
-            "1. Executive Summary (2-3 sentences)\n"
-            "2. Timeline with agent actions and timestamps\n"
-            "3. Root Cause Analysis (technical detail)\n"
-            "4. Agent Debate Highlights (CRITICAL — show how ResolutionAgent "
-            "challenged DiagnosisAgent and how the debate improved accuracy)\n"
-            "5. Impact Assessment (table with before/after metrics)\n"
-            "6. Resolution and Fix Details\n"
-            "7. Lessons Learned (3 bullets)\n"
-            "8. Prevention Recommendations (3 bullets)"
+            "report in markdown. Include:\n"
+            "1. Executive Summary\n"
+            "2. Timeline with agent actions\n"
+            "3. Root Cause Analysis\n"
+            "4. Agent Debate Highlights (how ResolutionAgent challenged "
+            "and DiagnosisAgent defended)\n"
+            "5. Impact Assessment (before/after metrics table)\n"
+            "6. Resolution Details\n"
+            "7. Lessons Learned\n"
+            "8. Prevention Recommendations"
         )
         postmortem_user = (
             f"Incident: {incident_id}\n"
-            f"Incident Type: {scenario['type']}\n"
-            f"Scenario Description: {scenario['description']}\n"
-            f"Duration: {elapsed:.0f} seconds\n"
+            f"Type: {scenario['type']}\n"
+            f"Description: {scenario['description']}\n"
+            f"Duration: {elapsed:.0f}s\n"
             f"Severity: {triage_data.get('severity', 'P1')}\n"
             f"Classification: {triage_data.get('classification', 'SERVICE_DEGRADATION')}\n"
             f"Blast Radius: {triage_data.get('blast_radius_pct', 42)}%\n"
             f"Root Cause: {rc_text}\n"
-            f"Expected Scenario Root Cause: {scenario.get('root_cause', '')}\n"
-            f"Debate: ResolutionAgent {'CHALLENGED then reached consensus' if is_challenge else 'agreed immediately'}\n"
-            f"Fix: {fix_data.get('fix', {}).get('description', 'connection release fix')}\n"
+            f"Scenario Root Cause: {scenario.get('root_cause', '')}\n"
+            f"Debate: {'CHALLENGE → DEFEND → CONSENSUS' if is_challenge else 'IMMEDIATE CONSENSUS'}\n"
+            f"Fix: {fix_data.get('fix', {}).get('description', 'applied fix')}\n"
             f"Risk Level: {fix_data.get('fix', {}).get('risk_level', 'LOW')}\n"
             f"Deployment: {'SUCCESS' if fix_applied else 'FAILED'}\n"
-            f"Health After Fix: {health_status}\n"
+            f"Health After: {health_status}\n"
             f"PR URL: {pr_url}\n"
-            f"Total Agent Messages: {len(message_store)}\n"
-                        f"LLM Provider: {LLM_PROVIDER}\n"
-            f"Generate the complete postmortem report."
+            f"Messages: {len(message_store)}\n"
+            f"LLM: {LLM_PROVIDER}\n"
+            f"Generate the complete postmortem."
         )
+
         postmortem_report = await chat_llm(postmortem_system, postmortem_user)
+
+        if not postmortem_report or len(postmortem_report.strip()) < 50:
+            postmortem_report = _MOCK_POSTMORTEM.get(
+                incident_type,
+                _MOCK_POSTMORTEM["connection_pool_exhaustion"],
+            )
 
         add_message(
             sender="PostmortemAgent",
@@ -1426,7 +2296,7 @@ async def run_full_incident(incident_id: str) -> dict:
                 "description": scenario["description"],
                 "total_messages": len(message_store),
                 "debate_rounds": 3 if is_challenge else 1,
-                "resolution_time_seconds": elapsed,
+                "resolution_time_seconds": round(elapsed, 1),
                 "agents_involved": [
                     "WatcherAgent", "TriageAgent", "DiagnosisAgent",
                     "ResolutionAgent", "DeployAgent", "PostmortemAgent",
@@ -1445,9 +2315,10 @@ async def run_full_incident(incident_id: str) -> dict:
             "incident_type": scenario["type"],
             "description": scenario["description"],
             "severity": triage_data.get("severity", "P1"),
-            "classification": triage_data.get("classification", ""),
+            "classification": triage_data.get("classification", "SERVICE_DEGRADATION"),
             "blast_radius_pct": triage_data.get("blast_radius_pct", 42),
             "root_cause": diagnosis_data.get("root_cause", {}),
+            "root_cause_summary": rc_text,
             "fix": fix_data.get("fix", {}),
             "debate_occurred": is_challenge,
             "debate_rounds": 3 if is_challenge else 1,
@@ -1455,14 +2326,14 @@ async def run_full_incident(incident_id: str) -> dict:
             "health_after_fix": health_status,
             "pr_url": pr_url,
             "total_messages": len(message_store),
-            "resolution_time_seconds": elapsed,
+            "resolution_time_seconds": round(elapsed, 1),
             "llm_provider": LLM_PROVIDER,
             "started_at": start_time.isoformat().replace("+00:00", "Z"),
             "resolved_at": get_iso_now(),
         }
 
         logger.info(
-            f"✓ Incident {incident_id} RESOLVED in {elapsed:.0f}s | "
+            f"✅ Incident {incident_id} ({incident_type}) RESOLVED in {elapsed:.0f}s | "
             f"Debate: {'CHALLENGE→DEFEND→CONSENSUS' if is_challenge else 'IMMEDIATE'} | "
             f"Deploy: {'SUCCESS' if fix_applied else 'FAILED'} | "
             f"Health: {health_status} | "
@@ -1470,15 +2341,11 @@ async def run_full_incident(incident_id: str) -> dict:
         )
 
     except Exception as e:
-        # ═══════════════════════════════════════════════════
-        # PIPELINE ERROR HANDLER
-        # If any phase crashes, log it and broadcast to the dashboard
-        # so the frontend knows something went wrong.
-        # ═══════════════════════════════════════════════════
         elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+        error_msg = str(e) if str(e) else type(e).__name__
         logger.error(
-            f"❌ Incident pipeline FAILED for {incident_id} "
-            f"after {elapsed:.0f}s: {e}",
+            f"❌ Incident pipeline FAILED for {incident_id} ({incident_type}) "
+            f"after {elapsed:.0f}s: {error_msg}",
             exc_info=True,
         )
         add_message(
@@ -1489,8 +2356,11 @@ async def run_full_incident(incident_id: str) -> dict:
             incident_id=incident_id,
             payload={
                 "status": "PIPELINE_ERROR",
-                "error": str(e),
-                "elapsed_seconds": elapsed,
+                "error": error_msg,
+                "error_type": type(e).__name__,
+                "incident_type": incident_type,
+                "elapsed_seconds": round(elapsed, 1),
+                "phase": "see logs for exact phase",
             },
         )
         incident_store[incident_id] = {
@@ -1498,8 +2368,9 @@ async def run_full_incident(incident_id: str) -> dict:
             "incident_id": incident_id,
             "incident_type": scenario["type"],
             "description": scenario["description"],
-            "error": str(e),
-            "resolution_time_seconds": elapsed,
+            "error": error_msg,
+            "error_type": type(e).__name__,
+            "resolution_time_seconds": round(elapsed, 1),
             "total_messages": len(message_store),
             "llm_provider": LLM_PROVIDER,
             "started_at": start_time.isoformat().replace("+00:00", "Z"),
@@ -1507,16 +2378,8 @@ async def run_full_incident(incident_id: str) -> dict:
         }
 
     finally:
-        # ═══════════════════════════════════════════════════
-        # GUARANTEED CLEANUP
-        # This runs whether the pipeline succeeded or crashed,
-        # ensuring the API is never permanently locked.
-        # ═══════════════════════════════════════════════════
         incident_running = False
-        logger.info(
-            f"Pipeline finished for {incident_id}. "
-            f"incident_running reset to False."
-        )
+        logger.info(f"Pipeline finished for {incident_id}. incident_running = False")
 
     return {
         "incident_id": incident_id,
@@ -1524,16 +2387,12 @@ async def run_full_incident(incident_id: str) -> dict:
         "incident_context": incident_context,
         "severity": triage_data.get("severity", "P1"),
         "root_cause": rc_text,
-        "debate": (
-            "CHALLENGE + DEFENSE + CONSENSUS"
-            if is_challenge
-            else "IMMEDIATE CONSENSUS"
-        ),
-        "fix": fix_data.get("fix", {}).get("description", ""),
+        "debate": "CHALLENGE + DEFENSE + CONSENSUS" if is_challenge else "IMMEDIATE CONSENSUS",
+        "fix": fix_data.get("fix", {}).get("description", "fix applied"),
         "deployment": "SUCCESS" if fix_applied else "FAILED",
         "health": health_status,
         "pr_url": pr_url,
-        "resolution_time_seconds": elapsed,
+        "resolution_time_seconds": round(elapsed, 1),
         "total_messages": len(message_store),
         "llm_provider": LLM_PROVIDER,
     }

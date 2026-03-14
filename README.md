@@ -19,6 +19,25 @@
 
 ---
 
+## 🌐 Live Deployment & Repository
+
+| Item | Value |
+|------|-------|
+| **GitHub Repository** | https://github.com/kiran797979/IncidentZero |
+| **Frontend (Azure Static Web App)** | https://lemon-sea-0c5820a00.4.azurestaticapps.net |
+| **Backend Base URL (Azure Functions)** | https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net |
+| **Backend API Base** | https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net/api |
+| **Target App API Base** | https://incidentzero-target-gwasebfgf4gda8h2.eastasia-01.azurewebsites.net/api |
+
+### 🔗 Important Live API Endpoints
+
+- `GET` Health: `https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net/api/health`
+- `POST` Run Incident: `https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net/api/run-incident`
+- `GET` Messages: `https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net/api/messages?since=0`
+- `GET` Incidents: `https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net/api/incidents`
+
+---
+
 ## 📖 Overview
 
 **IncidentZero** is an autonomous site reliability engineering (SRE) system that demonstrates how a team of specialized AI agents can collaboratively resolve production incidents end-to-end. A chaos-injectable target application simulates real production failures (connection pool leaks), and a cinematic React dashboard provides full visibility into the multi-agent workflow as it unfolds.
@@ -31,7 +50,7 @@
 - **🔧 Autonomous Fix & Deploy** — Generates code fixes, applies them, and creates GitHub PRs
 - **📋 Auto-Generated Postmortems** — Comprehensive incident reports with timeline, root cause, and recommendations
 - **🎯 Chaos Engineering** — Injectable connection pool leak for realistic failure simulation
-- **🧠 Multi-LLM Support** — Azure OpenAI, OpenAI, or fully functional mock fallback (no API keys required)
+- **🧠 Multi-LLM Support** — Azure OpenAI, OpenRouter, OpenAI, or fully functional mock fallback (no API keys required)
 - **📊 MCP Message Protocol** — Structured inter-agent communication with full observability
 
 ---
@@ -229,6 +248,16 @@ func azure functionapp publish incidentzero-backend
 
 > Ensure your local Python version matches the Azure Function App runtime version to avoid runtime dependency issues.
 
+### Azure Frontend / Backend Wiring
+
+- Frontend URL: `https://lemon-sea-0c5820a00.4.azurestaticapps.net`
+- Backend API base: `https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net/api`
+- Set frontend env for production:
+
+```bash
+REACT_APP_BACKEND_URL=https://incidentzero-backend-b6beb2e7gzf4c6f8.eastasia-01.azurewebsites.net/api
+```
+
 ---
 
 ## 🤖 Agent Details
@@ -394,6 +423,8 @@ This simulates a real-world connection pool leak — the class of production bug
 | `AZURE_OPENAI_KEY` | Azure OpenAI API key | — |
 | `AZURE_OPENAI_DEPLOYMENT` | Azure OpenAI deployment name | `gpt-4o` |
 | `AZURE_OPENAI_API_VERSION` | Azure OpenAI API version | `2024-08-06` |
+| `OPENROUTER_API_KEY` | OpenRouter API key (secondary provider) | — |
+| `OPENROUTER_MODEL` | OpenRouter model name | `openai/gpt-4o-mini` |
 | `OPENAI_API_KEY` | OpenAI API key (fallback provider) | — |
 | `GITHUB_TOKEN` | GitHub Personal Access Token for PR creation | — |
 | `GITHUB_REPO` | GitHub repository (`owner/name`) | — |
@@ -402,9 +433,9 @@ This simulates a real-world connection pool leak — the class of production bug
 | `REACT_APP_BACKEND_URL` | Frontend: backend REST API URL | `http://localhost:8080` |
 | `REACT_APP_WS_URL` | Frontend: backend WebSocket URL | `ws://localhost:8080/ws` |
 
-> **Important:** Set `REACT_APP_BACKEND_URL=http://localhost:8091` and `REACT_APP_WS_URL=ws://localhost:8091/ws` when running the frontend, since the backend defaults to port **8091**.
+> **Important:** Set `REACT_APP_BACKEND_URL=http://localhost:8091` and `REACT_APP_WS_URL=ws://localhost:8091/ws` when running the frontend locally, since the local FastAPI backend defaults to port **8091**.
 
-**LLM Provider Auto-Detection:** Azure OpenAI → OpenAI → Mock fallback. **No API keys are required** — the mock provider generates realistic responses for the full pipeline including debate.
+**LLM Provider Auto-Detection:** Azure OpenAI → OpenRouter → OpenAI → Mock fallback. **No API keys are required** — the mock provider generates realistic responses for the full pipeline including debate.
 
 ---
 

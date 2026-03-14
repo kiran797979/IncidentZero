@@ -59,53 +59,50 @@ CORS_HEADERS = {
 INCIDENT_SCENARIOS = [
     {
         "type": "connection_pool_exhaustion",
-        "severity": "P1",
         "description": "Database connection pool leak causing request failures",
         "symptoms": {
             "error_rate": 0.42,
             "latency_ms": 8000,
             "connections": "100/100"
-        }
+        },
+        "root_cause": "Connections are not released in the finally block causing pool exhaustion"
     },
     {
         "type": "memory_leak",
-        "severity": "P1",
         "description": "Memory usage increasing due to unbounded cache growth",
         "symptoms": {
             "memory_usage": "92%",
-            "latency_ms": 4000,
-            "error_rate": 0.18
-        }
+            "latency_ms": 4200
+        },
+        "root_cause": "Cache storing objects without eviction policy causing memory leak"
     },
     {
         "type": "slow_database_queries",
-        "severity": "P2",
-        "description": "Database queries slowing due to missing index",
+        "description": "Database queries slow due to missing index",
         "symptoms": {
             "latency_ms": 6000,
-            "error_rate": 0.05,
             "query_time": "5s"
-        }
+        },
+        "root_cause": "Missing database index causing full table scans"
     },
     {
         "type": "external_api_failure",
-        "severity": "P1",
         "description": "Third-party payment API returning 503 errors",
         "symptoms": {
             "error_rate": 0.37,
             "api_status": "503",
             "latency_ms": 7000
-        }
+        },
+        "root_cause": "Upstream payment API intermittently failing"
     },
     {
         "type": "cache_failure",
-        "severity": "P2",
         "description": "Redis cache unavailable causing heavy DB load",
         "symptoms": {
             "cache_status": "down",
-            "latency_ms": 5000,
             "db_load": "high"
-        }
+        },
+        "root_cause": "Redis node unavailable forcing database reads"
     }
 ]
 
@@ -315,6 +312,13 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
     sp = system_prompt.lower()
     up = user_prompt.lower()
 
+    scenario_type = "connection_pool_exhaustion"
+    if "type:" in up:
+        for line in up.splitlines():
+            if line.strip().startswith("type:"):
+                scenario_type = line.split(":", 1)[1].strip()
+                break
+
     if "triage" in sp:
         return json.dumps({
             "severity": "P1",
@@ -331,13 +335,6 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
         })
 
     elif "diagnos" in sp and "challenge" not in sp and "defend" not in sp:
-        scenario_type = "connection_pool_exhaustion"
-        if "type:" in up:
-            for line in up.splitlines():
-                if line.strip().startswith("type:"):
-                    scenario_type = line.split(":", 1)[1].strip()
-                    break
-
         if scenario_type == "memory_leak":
             root_cause_detail = "Unbounded cache storing objects without eviction policy"
             category = "MEMORY_LEAK"
@@ -386,20 +383,27 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
         })
 
     elif "challenge" in sp or "evaluate" in sp or "devil" in sp:
+        if scenario_type == "memory_leak":
+            challenge_reason = "Could this memory growth be caused by unbounded caching rather than database usage?"
+            alternative = "memory_pressure_from_cache"
+        elif scenario_type == "slow_database_queries":
+            challenge_reason = "Could slow queries be causing resource contention rather than connection leaks?"
+            alternative = "query_contention"
+        elif scenario_type == "external_api_failure":
+            challenge_reason = "Could upstream API failures be propagating errors through the service?"
+            alternative = "upstream_api_propagation"
+        elif scenario_type == "cache_failure":
+            challenge_reason = "Is the database overloaded due to cache misses?"
+            alternative = "cache_miss_overload"
+        else:
+            challenge_reason = "Could slow queries be holding connections longer than expected?"
+            alternative = "slow_query_blocking"
+
         return json.dumps({
             "assessment": "CHALLENGE",
-            "reasoning": (
-                "While connection pool exhaustion is likely, I want to "
-                "verify this isn't caused by slow queries holding connections "
-                "longer than expected. High connection utilization could be "
-                "a symptom of slow queries rather than actual leaks. Can "
-                "DiagnosisAgent provide connection hold time data?"
-            ),
-            "challenge_question": (
-                "What is the average connection hold time in error vs "
-                "success paths?"
-            ),
-            "alternative_hypothesis": "slow_query_blocking",
+            "reasoning": challenge_reason,
+            "challenge_question": "What direct evidence confirms this as the primary root cause?",
+            "alternative_hypothesis": alternative,
             "confidence_in_diagnosis": 0.65,
         })
 
@@ -424,39 +428,89 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
         })
 
     elif "fix" in sp or "resolution" in sp or "code" in sp:
+        if scenario_type == "memory_leak":
+            fix_description = "Add bounded cache with TTL and eviction policy to prevent memory leak"
+            fix_diff = (
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -20,6 +20,10 @@\n"
+                "+MAX_CACHE_ITEMS = 10000\n"
+                "+CACHE_TTL_SECONDS = 300\n"
+                "@@ -85,6 +89,10 @@\n"
+                "+if len(cache_store) > MAX_CACHE_ITEMS:\n"
+                "+    evict_oldest_entries(cache_store)\n"
+                "+cache_store[key] = (value, now_ts)\n"
+                "+cleanup_expired(cache_store, CACHE_TTL_SECONDS)\n"
+            )
+            fix_explanation = "Limits cache growth and removes stale entries to stop unbounded memory usage."
+        elif scenario_type == "slow_database_queries":
+            fix_description = "Add missing index for frequently filtered task query"
+            fix_diff = (
+                "--- a/schema.sql\n"
+                "+++ b/schema.sql\n"
+                "@@ -40,3 +40,5 @@\n"
+                "+CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at\n"
+                "+ON tasks(status, created_at DESC);\n"
+            )
+            fix_explanation = "The new index removes full table scans and reduces query latency."
+        elif scenario_type == "external_api_failure":
+            fix_description = "Add circuit breaker and retry with backoff for payment API"
+            fix_diff = (
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -120,6 +120,14 @@\n"
+                "+for attempt in range(3):\n"
+                "+    try:\n"
+                "+        return payment_client.charge(payload, timeout=5)\n"
+                "+    except Upstream503Error:\n"
+                "+        await asyncio.sleep(2 ** attempt)\n"
+                "+open_circuit_if_threshold_exceeded()\n"
+            )
+            fix_explanation = "Contains upstream instability impact and improves resilience under intermittent 503s."
+        elif scenario_type == "cache_failure":
+            fix_description = "Enable stale cache fallback and throttle database reads on cache outage"
+            fix_diff = (
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -70,5 +70,11 @@\n"
+                "+if not redis_available():\n"
+                "+    value = local_stale_cache.get(key)\n"
+                "+    if value is not None:\n"
+                "+        return value\n"
+                "+    await db_read_throttler.acquire()\n"
+            )
+            fix_explanation = "Reduces DB overload during cache outages by serving stale data and throttling misses."
+        else:
+            fix_description = "Fix connection pool leak by ensuring unconditional release in finally blocks"
+            fix_diff = (
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -60,8 +60,4 @@ def list_tasks():\n"
+                "     finally:\n"
+                "-        if conn is not None:\n"
+                "-            if BUG_INJECTED:\n"
+                "-                if random.random() < 0.3:\n"
+                "-                    pool.release(conn)\n"
+                "-                else:\n"
+                "-                    pass  # CONNECTION LEAKED!\n"
+                "+        if conn is not None:\n"
+                "+            pool.release(conn)  # ALWAYS release"
+            )
+            fix_explanation = "Connections were conditionally released, causing leaks; fix ensures unconditional release."
+
         return json.dumps({
             "fix": {
                 "file": "app.py",
-                "description": (
-                    "Fix connection pool leak by ensuring unconditional "
-                    "release in finally blocks"
-                ),
-                "diff": (
-                    "--- a/app.py\n"
-                    "+++ b/app.py\n"
-                    "@@ -60,8 +60,4 @@ def list_tasks():\n"
-                    "     finally:\n"
-                    "-        if conn is not None:\n"
-                    "-            if BUG_INJECTED:\n"
-                    "-                if random.random() < 0.3:\n"
-                    "-                    pool.release(conn)\n"
-                    "-                else:\n"
-                    "-                    pass  # CONNECTION LEAKED!\n"
-                    "+        if conn is not None:\n"
-                    "+            pool.release(conn)  # ALWAYS release"
-                ),
+                "description": fix_description,
+                "diff": fix_diff,
                 "risk_level": "LOW",
-                "explanation": (
-                    "Connections were conditionally released based on a "
-                    "random check, causing 70% of connections to leak. "
-                    "Fix ensures unconditional release in all code paths."
-                ),
+                "explanation": fix_explanation,
                 "lines_changed": 6,
             },
             "validation_steps": [
-                "Verify connection count returns to normal after requests",
-                "Confirm /tasks returns 200 under load",
-                "Check no 500 errors after fix applied",
+                "Verify key symptom metrics trend down after fix",
+                "Confirm target endpoints stay healthy under load",
+                "Check no recurring errors for this incident type",
             ],
         })
 
@@ -839,6 +893,10 @@ async def run_full_incident(incident_id: str) -> dict:
     start_time = datetime.utcnow()
     scenario = random.choice(INCIDENT_SCENARIOS)
     incident_type = scenario["type"]
+    incident_context = {
+        "scenario": scenario,
+        "incident_type": incident_type,
+    }
 
     # ═══════════════════════════════════════════════════
     # PHASE 1: ORCHESTRATOR — Start Lifecycle
@@ -1089,7 +1147,22 @@ async def run_full_incident(incident_id: str) -> dict:
         "\"challenge_question\": \"string\", \"alternative_hypothesis\": \"string\", "
         "\"confidence_in_diagnosis\": number}"
     )
+    if scenario["type"] == "memory_leak":
+        challenge_reason = "Could this memory growth be caused by unbounded caching rather than database usage?"
+    elif scenario["type"] == "slow_database_queries":
+        challenge_reason = "Could slow queries be causing resource contention rather than connection leaks?"
+    elif scenario["type"] == "external_api_failure":
+        challenge_reason = "Could upstream API failures be propagating errors through the service?"
+    elif scenario["type"] == "cache_failure":
+        challenge_reason = "Is the database overloaded due to cache misses?"
+    else:
+        challenge_reason = "Could slow queries be holding connections longer than expected?"
+
     debate_user = (
+        f"Incident scenario:\n"
+        f"- Type: {scenario['type']}\n"
+        f"- Description: {scenario['description']}\n"
+        f"- Suggested challenge angle: {challenge_reason}\n\n"
         f"Diagnosis from DiagnosisAgent:\n"
         f"{json.dumps(diagnosis_data, indent=2)}\n\n"
         f"Critically evaluate this diagnosis. Be skeptical."
@@ -1106,6 +1179,7 @@ async def run_full_incident(incident_id: str) -> dict:
         incident_id=incident_id,
         payload={
             "evaluation": debate_data,
+            "challenge_reason": challenge_reason,
             "debate_round": 1,
             "debate_concluded": not is_challenge,
         },
@@ -1188,6 +1262,10 @@ async def run_full_incident(incident_id: str) -> dict:
         "\"validation_steps\": [strings]}"
     )
     fix_user = (
+        f"Incident scenario:\n"
+        f"- Type: {scenario['type']}\n"
+        f"- Description: {scenario['description']}\n"
+        f"- Expected root cause context: {scenario.get('root_cause', '')}\n\n"
         f"Confirmed root cause:\n"
         f"{json.dumps(diagnosis_data.get('root_cause', {}), indent=2)}\n\n"
         f"Generate a minimal, safe code fix."
@@ -1305,6 +1383,7 @@ async def run_full_incident(incident_id: str) -> dict:
         f"Classification: {triage_data.get('classification', 'SERVICE_DEGRADATION')}\n"
         f"Blast Radius: {triage_data.get('blast_radius_pct', 42)}%\n"
         f"Root Cause: {rc_text}\n"
+        f"Expected Scenario Root Cause: {scenario.get('root_cause', '')}\n"
         f"Debate: ResolutionAgent {'CHALLENGED then reached consensus' if is_challenge else 'agreed immediately'}\n"
         f"Fix: {fix_data.get('fix', {}).get('description', 'connection release fix')}\n"
         f"Risk Level: {fix_data.get('fix', {}).get('risk_level', 'LOW')}\n"
@@ -1377,6 +1456,7 @@ async def run_full_incident(incident_id: str) -> dict:
     return {
         "incident_id": incident_id,
         "incident_type": scenario["type"],
+        "incident_context": incident_context,
         "severity": triage_data.get("severity", "P1"),
         "root_cause": rc_text,
         "debate": "CHALLENGE + DEFENSE + CONSENSUS" if is_challenge else "IMMEDIATE CONSENSUS",

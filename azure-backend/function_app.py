@@ -1423,6 +1423,25 @@ def get_messages(req: func.HttpRequest) -> func.HttpResponse:
     })
 
 
+@app.route(route="reset", methods=["POST", "OPTIONS"])
+def api_reset(req: func.HttpRequest) -> func.HttpResponse:
+    """Reset dashboard/session state by clearing in-memory incident data."""
+    if req.method == "OPTIONS":
+        return cors_preflight()
+
+    global incident_running
+    message_store.clear()
+    incident_store.clear()
+    incident_running = False
+
+    return make_response({
+        "status": "RESET",
+        "total_messages": len(message_store),
+        "active_incidents": len(incident_store),
+        "incident_running": incident_running,
+    })
+
+
 @app.route(route="incidents", methods=["GET", "OPTIONS"])
 def get_incidents(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":

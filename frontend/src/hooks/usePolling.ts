@@ -61,5 +61,22 @@ export function usePolling(backendUrl: string, intervalMs: number = 2000) {
     sinceRef.current = 0;
   }, []);
 
-  return { messages, connected, clearMessages };
+  const resetToLatest = useCallback(async () => {
+    try {
+      const resp = await fetch(backendUrl + "/messages?since=0");
+      if (resp.ok) {
+        const data: PollResponse = await resp.json();
+        setMessages([]);
+        sinceRef.current = data.total || 0;
+      } else {
+        setMessages([]);
+        sinceRef.current = 0;
+      }
+    } catch {
+      setMessages([]);
+      sinceRef.current = 0;
+    }
+  }, [backendUrl]);
+
+  return { messages, connected, clearMessages, resetToLatest };
 }

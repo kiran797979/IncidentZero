@@ -303,7 +303,7 @@ function detectIncidentType(messages: MCPMessage[]): string {
    ═══════════════════════════════════════════════════════════ */
 
 function App() {
-  const { messages, connected, clearMessages } = usePolling(BACKEND_URL, 2000);
+  const { messages, connected, clearMessages, resetToLatest } = usePolling(BACKEND_URL, 2000);
 
   // ─── Core State ─────────────────────────────────────────
   const [injecting, setInjecting] = useState(false);
@@ -480,9 +480,34 @@ function App() {
   }, [incidentStatus]);
 
   useEffect(() => {
-    if (debateMessages.length > 0 && activeTab === "timeline") setActiveTab("debate");
     if (postmortem) setShowPostmortem(true);
-  }, [debateMessages.length, postmortem, activeTab]);
+  }, [postmortem]);
+
+  // On fresh page load, clear stale completed incidents from backend memory
+  // so dashboard doesn't stay stuck on "resolved" after reload.
+  useEffect(() => {
+    const bootstrap = async () => {
+      try {
+        const statusResp = await fetch(BACKEND_URL + "/status");
+        if (!statusResp.ok) return;
+        const status = await statusResp.json();
+        if (!status?.incident_running) {
+          await fetch(BACKEND_URL + "/reset", { method: "POST" }).catch(() => {});
+          await resetToLatest();
+          setBugActive(false);
+          setIncidentStartTime(null);
+          setElapsedTime(0);
+          setIncidentType("");
+          setActiveTab("timeline");
+          setShowPostmortem(false);
+          setShowCelebration(false);
+        }
+      } catch {
+        // best-effort bootstrap cleanup
+      }
+    };
+    bootstrap();
+  }, [resetToLatest]);
 
   // ─── Actions ────────────────────────────────────────────
   const injectBug = useCallback(
@@ -539,7 +564,7 @@ function App() {
   );
 
   const resetDashboard = useCallback(() => {
-    clearMessages();
+    resetToLatest();
     setBugActive(false);
     setInjecting(false);
     setIncidentStartTime(null);
@@ -554,7 +579,7 @@ function App() {
     setMsgHistory([0]);
 
     fetch(BACKEND_URL + "/reset", { method: "POST" }).catch(() => {});
-  }, [clearMessages]);
+  }, [resetToLatest]);
 
   // ─── Helpers ────────────────────────────────────────────
   const formatTime = (ts: string) => {

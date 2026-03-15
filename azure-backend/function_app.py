@@ -1184,6 +1184,11 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
     if "diagnos" in sp and "challenge" not in sp and "defend" not in sp and "devil" not in sp:
         return json.dumps(_MOCK_DIAGNOSIS.get(scenario_type, _MOCK_DIAGNOSIS["connection_pool_exhaustion"]))
 
+    # Important: check postmortem BEFORE challenge keywords.
+    # Postmortem prompts include words like "challenged" in debate highlights.
+    if "postmortem" in sp:
+        return _MOCK_POSTMORTEM.get(scenario_type, _MOCK_POSTMORTEM["connection_pool_exhaustion"])
+
     if "challenge" in sp or "evaluate" in sp or "devil" in sp or "skeptic" in sp:
         return json.dumps(_MOCK_CHALLENGE.get(scenario_type, _MOCK_CHALLENGE["connection_pool_exhaustion"]))
 
@@ -1193,14 +1198,42 @@ def mock_response(system_prompt: str, user_prompt: str = "") -> str:
     if "fix" in sp or "resolution" in sp or "code" in sp:
         return json.dumps(_MOCK_FIX.get(scenario_type, _MOCK_FIX["connection_pool_exhaustion"]))
 
-    if "postmortem" in sp:
-        return _MOCK_POSTMORTEM.get(scenario_type, _MOCK_POSTMORTEM["connection_pool_exhaustion"])
-
     return json.dumps({
         "response": f"Mock response for scenario {scenario_type}",
         "scenario": scenario_type,
         "note": "Configure Azure OpenAI / OpenRouter / OpenAI for real AI responses",
     })
+
+
+def normalize_postmortem_report(report_text: str, incident_type: str) -> str:
+    """Guarantee a full markdown postmortem report string."""
+    fallback = _MOCK_POSTMORTEM.get(
+        incident_type,
+        _MOCK_POSTMORTEM["connection_pool_exhaustion"],
+    )
+
+    if not isinstance(report_text, str):
+        return fallback
+
+    candidate = report_text.strip()
+    if len(candidate) < 120:
+        return fallback
+
+    # Sometimes models return debate JSON (assessment/challenge) instead of a report.
+    parsed = parse_json_response(candidate)
+    if isinstance(parsed, dict) and (
+        "assessment" in parsed
+        or "challenge_question" in parsed
+        or "confidence_in_diagnosis" in parsed
+    ):
+        return fallback
+
+    # Ensure markdown-report shape.
+    lowered = candidate.lower()
+    if "# incident postmortem" not in lowered and "## executive summary" not in lowered:
+        return fallback
+
+    return candidate
 
 
 def parse_json_response(text: str) -> dict:
@@ -2277,12 +2310,7 @@ async def run_full_incident(incident_id: str, requested_scenario: str | None = N
         )
 
         postmortem_report = await chat_llm(postmortem_system, postmortem_user)
-
-        if not postmortem_report or len(postmortem_report.strip()) < 50:
-            postmortem_report = _MOCK_POSTMORTEM.get(
-                incident_type,
-                _MOCK_POSTMORTEM["connection_pool_exhaustion"],
-            )
+        postmortem_report = normalize_postmortem_report(postmortem_report, incident_type)
 
         add_message(
             sender="PostmortemAgent",
